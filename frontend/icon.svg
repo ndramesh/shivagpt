@@ -1,0 +1,22 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#7c5cff"/>
+      <stop offset="100%" stop-color="#a888ff"/>
+    </linearGradient>
+    <linearGradient id="glyph" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#ffffff" stop-opacity="0.97"/>
+      <stop offset="100%" stop-color="#f0e8ff" stop-opacity="0.92"/>
+    </linearGradient>
+  </defs>
+  <rect width="512" height="512" rx="112" ry="112" fill="url(#bg)"/>
+  <!-- stylized 'S' tilde — short curl like a chat speech tail -->
+  <path d="M 358 168
+           C 318 132, 252 124, 208 152
+           C 162 182, 156 240, 204 268
+           L 308 326
+           C 356 354, 350 412, 304 442
+           C 260 470, 194 462, 154 426"
+        fill="none" stroke="url(#glyph)" stroke-width="48" stroke-linecap="round" stroke-linejoin="round"/>
+  <circle cx="394" cy="164" r="22" fill="#ffffff" opacity="0.95"/>
+</svg>
