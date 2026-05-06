@@ -1002,6 +1002,134 @@
       margin: 4px 0;
     }
 
+    /* Image action toolbar on attached image chips */
+    .img-actions {
+      display: flex;
+      gap: 3px;
+      flex-wrap: wrap;
+      margin-top: 4px;
+      max-width: 220px;
+    }
+    .img-action-btn {
+      font-size: 10px;
+      padding: 2px 6px;
+      border: 1px solid var(--border);
+      border-radius: 4px;
+      background: var(--bg-elev-1);
+      color: var(--text-2);
+      cursor: pointer;
+      transition: all var(--transition);
+      white-space: nowrap;
+    }
+    .img-action-btn:hover {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+    .img-action-btn:disabled {
+      opacity: 0.4;
+      cursor: wait;
+    }
+
+    /* Image viewer modal */
+    .img-viewer {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 200;
+      background: rgba(0, 0, 0, 0.85);
+      backdrop-filter: blur(8px);
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 20px;
+    }
+    .img-viewer.show { display: flex; }
+    .img-viewer-close {
+      position: absolute;
+      top: 16px;
+      right: 20px;
+      background: none;
+      border: none;
+      color: white;
+      font-size: 28px;
+      cursor: pointer;
+      z-index: 201;
+      opacity: 0.7;
+      transition: opacity var(--transition);
+    }
+    .img-viewer-close:hover { opacity: 1; }
+    .img-viewer img {
+      max-width: 90vw;
+      max-height: 65vh;
+      border-radius: 8px;
+      box-shadow: 0 8px 32px rgba(0,0,0,0.5);
+    }
+    .img-viewer-info {
+      color: var(--text-3);
+      font-size: 13px;
+      margin-top: 10px;
+    }
+    .img-viewer-toolbar {
+      display: flex;
+      gap: 6px;
+      flex-wrap: wrap;
+      margin-top: 14px;
+      justify-content: center;
+    }
+    .img-viewer-toolbar button {
+      font-size: 12px;
+      padding: 6px 14px;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 6px;
+      background: rgba(255,255,255,0.08);
+      color: white;
+      cursor: pointer;
+      transition: all var(--transition);
+    }
+    .img-viewer-toolbar button:hover {
+      background: rgba(255,255,255,0.16);
+      border-color: var(--accent);
+    }
+    .img-viewer-toolbar button:disabled {
+      opacity: 0.4;
+      cursor: wait;
+    }
+    .img-viewer-toolbar .download-btn {
+      background: var(--accent);
+      border-color: var(--accent);
+    }
+    .img-viewer-toolbar .download-btn:hover {
+      background: var(--accent-hover);
+    }
+
+    /* Vision model hint */
+    .vision-hint {
+      max-width: 760px;
+      margin: 0 auto 6px;
+      padding: 6px 12px;
+      font-size: 12px;
+      color: var(--text-3);
+      background: var(--bg-elev-1);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      display: none;
+      align-items: center;
+      gap: 6px;
+    }
+    .vision-hint.show { display: flex; }
+    .vision-hint button {
+      font-size: 11px;
+      padding: 2px 8px;
+      border: 1px solid var(--accent);
+      border-radius: 4px;
+      background: transparent;
+      color: var(--accent);
+      cursor: pointer;
+      margin-left: auto;
+      white-space: nowrap;
+    }
+    .vision-hint button:hover { background: var(--accent); color: white; }
+
     /* ---------- Drawer / modal ---------- */
     .scrim {
       position: fixed;
@@ -1511,6 +1639,10 @@
       <div class="messages" id="messages"></div>
 
       <div class="composer-wrap">
+        <div id="visionHint" class="vision-hint">
+          <span>💡 Using a text-only model. Switch to a vision model for image understanding.</span>
+          <button id="switchVisionBtn">Use qwen2.5vl</button>
+        </div>
         <div id="attachPreview" class="attach-preview"></div>
         <div class="composer">
           <input type="file" id="fileInput" multiple hidden
@@ -1531,6 +1663,27 @@
       </div>
       <div class="drag-overlay" id="dragOverlay"><span>Drop files here</span></div>
     </main>
+  </div>
+
+  <!-- Image viewer modal -->
+  <div class="img-viewer" id="imgViewer">
+    <button class="img-viewer-close" id="imgViewerClose" aria-label="Close">&times;</button>
+    <img id="imgViewerImg" src="" alt="Preview" />
+    <div class="img-viewer-info" id="imgViewerInfo"></div>
+    <div class="img-viewer-toolbar" id="imgViewerToolbar">
+      <button data-op="upscale" data-params='{"factor":2}'>Upscale 2×</button>
+      <button data-op="upscale" data-params='{"factor":4}'>Upscale 4×</button>
+      <button data-op="rotate" data-params='{"degrees":90}'>Rotate 90°</button>
+      <button data-op="flip" data-params='{"direction":"horizontal"}'>Flip H</button>
+      <button data-op="flip" data-params='{"direction":"vertical"}'>Flip V</button>
+      <button data-op="sharpen">Sharpen</button>
+      <button data-op="grayscale">Grayscale</button>
+      <button data-op="invert">Invert</button>
+      <button data-op="blur" data-params='{"radius":3}'>Blur</button>
+      <button data-op="brightness" data-params='{"factor":1.3}'>Brighten</button>
+      <button data-op="contrast" data-params='{"factor":1.3}'>Contrast+</button>
+      <button class="download-btn" id="imgViewerDownload">⬇ Download</button>
+    </div>
   </div>
 
   <!-- Settings drawer -->
@@ -2340,7 +2493,12 @@
         pendingFiles.forEach((f, i) => {
           const chip = el('div', { class: 'attach-chip' + (f.uploading ? ' uploading' : '') });
           if (f.kind === 'image' && f.base64) {
-            const img = el('img', { class: 'chip-thumb', src: 'data:' + f.mime + ';base64,' + f.base64 });
+            const img = el('img', {
+              class: 'chip-thumb',
+              src: 'data:' + f.mime + ';base64,' + f.base64,
+              style: { cursor: 'pointer' },
+              onclick: () => openImgViewer(i),
+            });
             chip.appendChild(img);
           } else {
             const icon = f.kind === 'text' ? '📄' : (f.uploading ? '' : '📎');
@@ -2352,11 +2510,171 @@
           } else {
             chip.appendChild(el('button', {
               class: 'chip-remove', title: 'Remove',
-              onclick: () => { pendingFiles.splice(i, 1); renderAttachPreview(); }
+              onclick: () => { pendingFiles.splice(i, 1); renderAttachPreview(); updateVisionHint(); }
             }, '×'));
           }
           wrap.appendChild(chip);
+
+          // Image action buttons
+          if (f.kind === 'image' && f.base64 && !f.uploading) {
+            const actions = el('div', { class: 'img-actions' });
+            const ops = [
+              { label: '2× Up', op: 'upscale', params: { factor: 2 } },
+              { label: 'Rotate', op: 'rotate', params: { degrees: 90 } },
+              { label: 'B&W', op: 'grayscale' },
+              { label: 'Sharp', op: 'sharpen' },
+            ];
+            for (const o of ops) {
+              actions.appendChild(el('button', {
+                class: 'img-action-btn',
+                onclick: () => applyImageOp(i, o.op, o.params),
+              }, o.label));
+            }
+            chip.appendChild(actions);
+          }
         });
+        updateVisionHint();
+      }
+
+      /* ---------- Image processing ---------- */
+      async function processImage(base64, operation, params = {}) {
+        const r = await fetch(apiUrl('/api/image'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ image: base64, operation, params }),
+        });
+        if (!r.ok) {
+          const err = await r.text();
+          throw new Error(err);
+        }
+        return await r.json();
+      }
+
+      async function applyImageOp(fileIdx, operation, params = {}) {
+        const f = pendingFiles[fileIdx];
+        if (!f || f.kind !== 'image' || !f.base64) return;
+        // Disable buttons during processing
+        const chip = $('attachPreview').children[fileIdx];
+        const btns = chip ? chip.querySelectorAll('.img-action-btn') : [];
+        btns.forEach(b => b.disabled = true);
+        try {
+          const result = await processImage(f.base64, operation, params);
+          f.base64 = result.image;
+          f.mime = result.mime;
+          f.filename = `${operation}_${f.filename}`;
+          toast(`${operation}: ${result.width}×${result.height}`);
+          renderAttachPreview();
+        } catch (e) {
+          console.error('Image op failed:', e);
+          toast(`Failed: ${operation}`);
+          btns.forEach(b => b.disabled = false);
+        }
+      }
+
+      /* ---------- Image viewer modal ---------- */
+      let viewerFileIdx = -1;
+      let viewerBase64 = '';
+      let viewerMime = '';
+
+      function openImgViewer(fileIdx) {
+        const f = pendingFiles[fileIdx];
+        if (!f || f.kind !== 'image' || !f.base64) return;
+        viewerFileIdx = fileIdx;
+        viewerBase64 = f.base64;
+        viewerMime = f.mime;
+        _updateViewer(f.filename);
+        $('imgViewer').classList.add('show');
+      }
+
+      function openImgViewerFromBase64(base64, mime, filename) {
+        viewerFileIdx = -1;
+        viewerBase64 = base64;
+        viewerMime = mime;
+        _updateViewer(filename || 'image');
+        $('imgViewer').classList.add('show');
+      }
+
+      function _updateViewer(filename) {
+        const src = 'data:' + viewerMime + ';base64,' + viewerBase64;
+        $('imgViewerImg').src = src;
+        // Get dimensions from the image once loaded
+        const img = new Image();
+        img.onload = () => {
+          $('imgViewerInfo').textContent = `${filename} — ${img.width}×${img.height}`;
+        };
+        img.src = src;
+      }
+
+      function closeImgViewer() {
+        $('imgViewer').classList.remove('show');
+        $('imgViewerImg').src = '';
+        viewerBase64 = '';
+      }
+
+      async function viewerApplyOp(operation, params = {}) {
+        if (!viewerBase64) return;
+        const toolbar = $('imgViewerToolbar');
+        toolbar.querySelectorAll('button').forEach(b => b.disabled = true);
+        try {
+          const result = await processImage(viewerBase64, operation, params);
+          viewerBase64 = result.image;
+          viewerMime = result.mime;
+          const src = 'data:' + viewerMime + ';base64,' + viewerBase64;
+          $('imgViewerImg').src = src;
+          $('imgViewerInfo').textContent = `${operation} — ${result.width}×${result.height}`;
+          // If editing a pending file, update it too
+          if (viewerFileIdx >= 0 && pendingFiles[viewerFileIdx]) {
+            pendingFiles[viewerFileIdx].base64 = viewerBase64;
+            pendingFiles[viewerFileIdx].mime = viewerMime;
+            renderAttachPreview();
+          }
+          toast(`${operation}: ${result.width}×${result.height}`);
+        } catch (e) {
+          console.error('Viewer op failed:', e);
+          toast(`Failed: ${operation}`);
+        }
+        toolbar.querySelectorAll('button').forEach(b => b.disabled = false);
+      }
+
+      function viewerDownload() {
+        if (!viewerBase64) return;
+        const a = document.createElement('a');
+        a.href = 'data:' + viewerMime + ';base64,' + viewerBase64;
+        a.download = 'shivagpt-image.' + (viewerMime.includes('png') ? 'png' : 'jpg');
+        a.click();
+      }
+
+      /* ---------- Vision model hint ---------- */
+      const VISION_MODELS = ['qwen2.5vl', 'llava', 'llama3.2-vision', 'moondream', 'bakllava'];
+
+      function isVisionModel(name) {
+        if (!name) return false;
+        const n = name.toLowerCase();
+        return VISION_MODELS.some(v => n.includes(v));
+      }
+
+      function updateVisionHint() {
+        const hasImages = pendingFiles.some(f => f.kind === 'image');
+        const c = getActive();
+        const model = c ? resolveModel(c.model) : resolveModel(state.settings.defaultModel);
+        const hint = $('visionHint');
+        if (hasImages && !isVisionModel(model)) {
+          hint.classList.add('show');
+        } else {
+          hint.classList.remove('show');
+        }
+      }
+
+      function switchToVisionModel() {
+        const target = state.models.find(m => isVisionModel(m.name));
+        if (!target) { toast('No vision model found'); return; }
+        let c = getActive();
+        if (!c) c = newConvo();
+        c.model = target.name;
+        persistAll();
+        renderAllModelDropdowns();
+        updateVisionHint();
+        toast(`Switched to ${target.name}`);
       }
 
       async function send() {
@@ -2860,6 +3178,28 @@
           $('dragOverlay').classList.remove('show');
           if (e.dataTransfer.files.length) handleFileUpload(e.dataTransfer.files);
         });
+
+        // Image viewer modal
+        $('imgViewerClose').addEventListener('click', closeImgViewer);
+        $('imgViewer').addEventListener('click', (e) => {
+          if (e.target === $('imgViewer')) closeImgViewer();
+        });
+        $('imgViewerToolbar').addEventListener('click', (e) => {
+          const btn = e.target.closest('button[data-op]');
+          if (!btn) return;
+          const op = btn.dataset.op;
+          const params = btn.dataset.params ? JSON.parse(btn.dataset.params) : {};
+          viewerApplyOp(op, params);
+        });
+        $('imgViewerDownload').addEventListener('click', viewerDownload);
+        document.addEventListener('keydown', (e) => {
+          if (e.key === 'Escape' && $('imgViewer').classList.contains('show')) {
+            closeImgViewer();
+          }
+        });
+
+        // Vision model hint
+        $('switchVisionBtn').addEventListener('click', switchToVisionModel);
 
         // Topbar
         $('modelChip').addEventListener('click', openConvoSettings);

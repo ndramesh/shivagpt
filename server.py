@@ -432,6 +432,175 @@ async def upload_file(file: UploadFile = File(...)) -> dict[str, Any]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# Image manipulation
+# ---------------------------------------------------------------------------
+
+VALID_IMAGE_OPS = {
+    "upscale", "resize", "crop", "rotate", "flip",
+    "brightness", "contrast", "sharpen", "blur",
+    "grayscale", "invert",
+}
+
+
+def _process_image(img_bytes: bytes, operation: str, params: dict) -> tuple[bytes, str]:
+    """Apply a single image operation and return (png_bytes, mime)."""
+    from PIL import Image, ImageEnhance, ImageFilter
+
+    img = Image.open(io.BytesIO(img_bytes))
+    # Ensure RGB for most operations (handle RGBA gracefully)
+    had_alpha = img.mode == "RGBA"
+
+    if operation == "upscale":
+        factor = int(params.get("factor", 2))
+        factor = max(1, min(factor, 8))
+        new_size = (img.width * factor, img.height * factor)
+        img = img.resize(new_size, Image.LANCZOS)
+
+    elif operation == "resize":
+        w = int(params.get("width", img.width))
+        h = int(params.get("height", img.height))
+        w = max(1, min(w, 16384))
+        h = max(1, min(h, 16384))
+        img = img.resize((w, h), Image.LANCZOS)
+
+    elif operation == "crop":
+        left = int(params.get("left", 0))
+        top = int(params.get("top", 0))
+        right = int(params.get("right", img.width))
+        bottom = int(params.get("bottom", img.height))
+        img = img.crop((left, top, right, bottom))
+
+    elif operation == "rotate":
+        degrees = float(params.get("degrees", 90))
+        expand = params.get("expand", True)
+        img = img.rotate(-degrees, expand=expand, resample=Image.LANCZOS)
+
+    elif operation == "flip":
+        direction = params.get("direction", "horizontal")
+        if direction == "vertical":
+            img = img.transpose(Image.FLIP_TOP_BOTTOM)
+        else:
+            img = img.transpose(Image.FLIP_LEFT_RIGHT)
+
+    elif operation == "brightness":
+        factor = float(params.get("factor", 1.2))
+        factor = max(0.0, min(factor, 5.0))
+        img = ImageEnhance.Brightness(img).enhance(factor)
+
+    elif operation == "contrast":
+        factor = float(params.get("factor", 1.3))
+        factor = max(0.0, min(factor, 5.0))
+        img = ImageEnhance.Contrast(img).enhance(factor)
+
+    elif operation == "sharpen":
+        strength = int(params.get("strength", 1))
+        for _ in range(max(1, min(strength, 5))):
+            img = img.filter(ImageFilter.SHARPEN)
+
+    elif operation == "blur":
+        radius = float(params.get("radius", 3))
+        radius = max(0.5, min(radius, 50))
+        img = img.filter(ImageFilter.GaussianBlur(radius=radius))
+
+    elif operation == "grayscale":
+        img = img.convert("L").convert("RGBA" if had_alpha else "RGB")
+
+    elif operation == "invert":
+        from PIL import ImageOps
+        if had_alpha:
+            r, g, b, a = img.split()
+            rgb = Image.merge("RGB", (r, g, b))
+            rgb = ImageOps.invert(rgb)
+            img = Image.merge("RGBA", (*rgb.split(), a))
+        else:
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            img = ImageOps.invert(img)
+
+    else:
+        raise ValueError(f"Unknown operation: {operation}")
+
+    # Encode result
+    out = io.BytesIO()
+    fmt = "PNG" if had_alpha else "JPEG"
+    mime = "image/png" if had_alpha else "image/jpeg"
+    save_kw = {"quality": 92} if fmt == "JPEG" else {}
+    if img.mode == "RGBA" and fmt == "JPEG":
+        img = img.convert("RGB")
+    img.save(out, format=fmt, **save_kw)
+    return out.getvalue(), mime, img.width, img.height
+
+
+@app.post("/api/image")
+async def process_image(req: Request) -> dict[str, Any]:
+    """Apply an image manipulation operation.
+
+    Accepts JSON: { "image": "<base64>", "operation": "upscale", "params": { "factor": 2 } }
+    Returns JSON: { "image": "<base64>", "mime": "image/png", "width": ..., "height": ..., ... }
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    b64_in = body.get("image", "")
+    operation = body.get("operation", "").lower().strip()
+    params = body.get("params", {}) or {}
+
+    if not b64_in:
+        raise HTTPException(status_code=400, detail="Missing 'image' (base64)")
+    if operation not in VALID_IMAGE_OPS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid operation '{operation}'. Valid: {', '.join(sorted(VALID_IMAGE_OPS))}",
+        )
+
+    try:
+        img_bytes = base64.b64decode(b64_in)
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid base64 image data")
+
+    if len(img_bytes) > MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail="Image too large")
+
+    # Get original dimensions
+    from PIL import Image as _PILImage
+    orig = _PILImage.open(io.BytesIO(img_bytes))
+    orig_w, orig_h = orig.size
+
+    log.info("image op: %s  %dx%d  params=%s", operation, orig_w, orig_h, params)
+
+    try:
+        result_bytes, mime, new_w, new_h = await asyncio.wait_for(
+            asyncio.to_thread(_process_image, img_bytes, operation, params),
+            timeout=30.0,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Image processing timed out")
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        log.exception("image processing failed")
+        raise HTTPException(status_code=500, detail=f"Processing error: {e}")
+
+    b64_out = base64.b64encode(result_bytes).decode("ascii")
+
+    log.info("image op done: %s  %dx%d → %dx%d  (%d KB)",
+             operation, orig_w, orig_h, new_w, new_h, len(result_bytes) // 1024)
+
+    return {
+        "image": b64_out,
+        "mime": mime,
+        "width": new_w,
+        "height": new_h,
+        "original_width": orig_w,
+        "original_height": orig_h,
+        "operation": operation,
+        "size": len(result_bytes),
+    }
+
+
 @app.post("/api/cancel/{model}")
 async def cancel(model: str) -> dict:
     """Best-effort: ask Ollama to stop loading the given model.
