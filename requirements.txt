@@ -3,3 +3,4 @@ uvicorn[standard]>=0.27
 httpx>=0.27
 python-multipart>=0.0.9   # multipart file uploads
 pypdf>=4.0                # PDF text extraction
+Pillow>=10.0              # image manipulation (/api/image)
