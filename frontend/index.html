@@ -877,6 +877,131 @@
       text-align: center;
     }
 
+    /* ---------- Attachments ---------- */
+    .attach-btn {
+      flex-shrink: 0;
+      width: 34px;
+      height: 34px;
+      background: transparent;
+      color: var(--text-3);
+      border: none;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all var(--transition);
+      cursor: pointer;
+    }
+    .attach-btn:hover {
+      background: var(--bg-hover);
+      color: var(--text-1);
+    }
+    .attach-btn svg { width: 18px; height: 18px; }
+
+    .attach-preview {
+      max-width: 760px;
+      margin: 0 auto 6px;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 6px;
+    }
+    .attach-preview:empty { display: none; }
+
+    .attach-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 4px 10px;
+      background: var(--bg-elev-2);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      font-size: 12px;
+      color: var(--text-2);
+      max-width: 220px;
+      animation: fadeIn 200ms ease;
+    }
+    .attach-chip.uploading {
+      opacity: 0.6;
+    }
+    .attach-chip .chip-icon {
+      font-size: 14px;
+      flex-shrink: 0;
+    }
+    .attach-chip .chip-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      flex: 1;
+    }
+    .attach-chip .chip-thumb {
+      width: 28px;
+      height: 28px;
+      border-radius: 4px;
+      object-fit: cover;
+      flex-shrink: 0;
+    }
+    .attach-chip .chip-remove {
+      background: none;
+      border: none;
+      color: var(--text-3);
+      cursor: pointer;
+      padding: 0;
+      font-size: 16px;
+      line-height: 1;
+      flex-shrink: 0;
+    }
+    .attach-chip .chip-remove:hover { color: var(--error); }
+    .attach-chip .chip-spinner {
+      width: 14px;
+      height: 14px;
+      border: 2px solid var(--border-strong);
+      border-top-color: var(--accent);
+      border-radius: 50%;
+      animation: spin 0.6s linear infinite;
+      flex-shrink: 0;
+    }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .drag-overlay {
+      display: none;
+      position: fixed;
+      inset: 0;
+      z-index: 100;
+      background: rgba(124, 92, 255, 0.08);
+      border: 3px dashed var(--accent);
+      border-radius: 12px;
+      pointer-events: none;
+      align-items: center;
+      justify-content: center;
+    }
+    .drag-overlay.show { display: flex; }
+    .drag-overlay span {
+      font-size: 18px;
+      font-weight: 600;
+      color: var(--accent);
+      background: var(--bg-elev-1);
+      padding: 12px 24px;
+      border-radius: var(--radius);
+    }
+
+    .attach-indicator {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      font-size: 12px;
+      color: var(--text-3);
+      margin-bottom: 4px;
+    }
+    .attach-indicator svg { width: 12px; height: 12px; }
+    .attach-indicator .att-thumb {
+      width: 60px;
+      height: 60px;
+      border-radius: 6px;
+      object-fit: cover;
+      display: block;
+      margin: 4px 0;
+    }
+
     /* ---------- Drawer / modal ---------- */
     .scrim {
       position: fixed;
@@ -1386,7 +1511,15 @@
       <div class="messages" id="messages"></div>
 
       <div class="composer-wrap">
+        <div id="attachPreview" class="attach-preview"></div>
         <div class="composer">
+          <input type="file" id="fileInput" multiple hidden
+            accept="image/*,.pdf,.csv,.txt,.md,.json,.yaml,.yml,.xml,.log" />
+          <button class="attach-btn" id="attachBtn" title="Attach file" aria-label="Attach file">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+            </svg>
+          </button>
           <textarea id="composer" rows="1" placeholder="Message ShivaGPT..." autofocus></textarea>
           <button class="send-btn" id="sendBtn" title="Send (Enter)" aria-label="Send">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -1396,6 +1529,7 @@
         </div>
         <div class="composer-hint">Enter to send · Shift+Enter for newline · Esc to stop</div>
       </div>
+      <div class="drag-overlay" id="dragOverlay"><span>Drop files here</span></div>
     </main>
   </div>
 
@@ -2035,6 +2169,19 @@
         content.dataset.raw = '';   // we update via assignContent
         assignContent(content, m.content || '', !isUser && !isSys);
 
+        // Show attachment indicators for user messages with files
+        if (m.attachments && m.attachments.length) {
+          const attWrap = el('div', { style: { marginBottom: '6px' } });
+          for (const att of m.attachments) {
+            const ind = el('div', { class: 'attach-indicator' });
+            ind.innerHTML = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></svg>';
+            ind.appendChild(document.createTextNode(' ' + att.filename));
+            if (att.pages) ind.appendChild(document.createTextNode(` (${att.pages} pages)`));
+            attWrap.appendChild(ind);
+          }
+          content.insertBefore(attWrap, content.firstChild);
+        }
+
         const actions = el('div', { class: 'msg-actions' });
         actions.appendChild(el('button', {
           class: 'icon-btn',
@@ -2160,14 +2307,100 @@
       }
 
       /* ---------- Sending + streaming ---------- */
+      /* ---------- Attachment state ---------- */
+      let pendingFiles = [];  // { kind, filename, base64?, text?, mime, uploading? }
+
+      async function handleFileUpload(files) {
+        for (const file of files) {
+          const placeholder = { filename: file.name, uploading: true, kind: 'unknown' };
+          pendingFiles.push(placeholder);
+          renderAttachPreview();
+          try {
+            const form = new FormData();
+            form.append('file', file);
+            const r = await fetch(apiUrl('/api/files'), { method: 'POST', body: form });
+            if (!r.ok) {
+              const err = await r.text();
+              throw new Error(err);
+            }
+            const result = await r.json();
+            Object.assign(placeholder, result, { uploading: false });
+          } catch (e) {
+            console.error('Upload failed:', e);
+            toast(`Upload failed: ${file.name}`);
+            pendingFiles = pendingFiles.filter(f => f !== placeholder);
+          }
+          renderAttachPreview();
+        }
+      }
+
+      function renderAttachPreview() {
+        const wrap = $('attachPreview');
+        wrap.innerHTML = '';
+        pendingFiles.forEach((f, i) => {
+          const chip = el('div', { class: 'attach-chip' + (f.uploading ? ' uploading' : '') });
+          if (f.kind === 'image' && f.base64) {
+            const img = el('img', { class: 'chip-thumb', src: 'data:' + f.mime + ';base64,' + f.base64 });
+            chip.appendChild(img);
+          } else {
+            const icon = f.kind === 'text' ? '📄' : (f.uploading ? '' : '📎');
+            chip.appendChild(el('span', { class: 'chip-icon' }, icon));
+          }
+          chip.appendChild(el('span', { class: 'chip-name', title: f.filename }, f.filename));
+          if (f.uploading) {
+            chip.appendChild(el('span', { class: 'chip-spinner' }));
+          } else {
+            chip.appendChild(el('button', {
+              class: 'chip-remove', title: 'Remove',
+              onclick: () => { pendingFiles.splice(i, 1); renderAttachPreview(); }
+            }, '×'));
+          }
+          wrap.appendChild(chip);
+        });
+      }
+
       async function send() {
         if (state.streaming) { stopStreaming(); return; }
         const text = $('composer').value.trim();
-        if (!text) return;
+        // Allow send if there's text OR attachments
+        if (!text && !pendingFiles.length) return;
+        // Wait for any uploads still in progress
+        if (pendingFiles.some(f => f.uploading)) { toast('Files still uploading...'); return; }
 
         let c = getActive();
         if (!c) c = newConvo();
-        c.messages.push({ role: 'user', content: text, ts: Date.now() });
+
+        // Build the user message with attachments
+        const images = [];
+        let contentParts = [];
+        for (const f of pendingFiles) {
+          if (f.kind === 'image' && f.base64) {
+            images.push(f.base64);
+            contentParts.push(`[Attached image: ${f.filename}]`);
+          } else if (f.kind === 'text' && f.text) {
+            const label = f.mime === 'application/pdf'
+              ? `[Attached: ${f.filename} (${f.pages || '?'} pages${f.truncated ? ', truncated' : ''})]`
+              : `[Attached: ${f.filename}]`;
+            contentParts.push(label + '\n' + f.text);
+          }
+        }
+        if (text) contentParts.push(text);
+        const fullContent = contentParts.join('\n\n');
+
+        const userMsg = { role: 'user', content: fullContent, ts: Date.now() };
+        if (images.length) userMsg.images = images;
+        // Store attachment metadata for display (don't persist huge base64)
+        if (pendingFiles.length) {
+          userMsg.attachments = pendingFiles.map(f => ({
+            filename: f.filename, kind: f.kind, mime: f.mime,
+            pages: f.pages, size: f.size,
+            thumb: f.kind === 'image' ? f.base64?.slice(0, 200) : undefined,
+          }));
+        }
+
+        c.messages.push(userMsg);
+        pendingFiles = [];
+        renderAttachPreview();
         $('composer').value = '';
         autoSize($('composer'));
         autoTitleFromFirstUserMsg(c);
@@ -2202,8 +2435,11 @@
           msgs.push({ role: 'system', content: c.systemPrompt });
         }
         for (const m of c.messages) {
-          if (m.role === 'system') continue; // we use convo-level system prompt
-          msgs.push({ role: m.role, content: m.content });
+          if (m.role === 'system') continue;
+          const msg = { role: m.role, content: m.content };
+          // Pass images array to Ollama for vision models
+          if (m.images && m.images.length) msg.images = m.images;
+          msgs.push(msg);
         }
         return msgs;
       }
@@ -2596,6 +2832,33 @@
         $('sendBtn').addEventListener('touchend', (e) => {
           e.preventDefault();  // prevent ghost click
           send();
+        });
+
+        // File attachments
+        $('attachBtn').addEventListener('click', () => $('fileInput').click());
+        $('fileInput').addEventListener('change', (e) => {
+          if (e.target.files.length) handleFileUpload(e.target.files);
+          e.target.value = '';  // reset so same file can be re-selected
+        });
+
+        // Drag-and-drop
+        let dragCounter = 0;
+        document.addEventListener('dragenter', (e) => {
+          e.preventDefault();
+          dragCounter++;
+          if (e.dataTransfer.types.includes('Files')) $('dragOverlay').classList.add('show');
+        });
+        document.addEventListener('dragleave', (e) => {
+          e.preventDefault();
+          dragCounter--;
+          if (dragCounter <= 0) { dragCounter = 0; $('dragOverlay').classList.remove('show'); }
+        });
+        document.addEventListener('dragover', (e) => e.preventDefault());
+        document.addEventListener('drop', (e) => {
+          e.preventDefault();
+          dragCounter = 0;
+          $('dragOverlay').classList.remove('show');
+          if (e.dataTransfer.files.length) handleFileUpload(e.dataTransfer.files);
         });
 
         // Topbar
