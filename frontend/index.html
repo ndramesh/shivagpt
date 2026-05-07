@@ -1627,6 +1627,16 @@
             <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4M7 10l5 5 5-5M12 15V3" />
           </svg>
         </button>
+        <button class="icon-btn" id="loginBtn" title="Admin Login" aria-label="Login">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4M10 17l5-5-5-5M15 12H3" />
+          </svg>
+        </button>
+        <button class="icon-btn" id="logoutBtn" title="Log out" aria-label="Log out" style="display:none;">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4M16 17l5-5-5-5M21 12H9" />
+          </svg>
+        </button>
         <button class="icon-btn" id="convoSettingsBtn" title="Conversation settings" aria-label="Conversation settings">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="1" />
@@ -1779,6 +1789,29 @@
   </aside>
 
   <!-- Prompt library modal -->
+  <div class="modal" id="loginModal" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3>Admin Login</h3>
+        <button class="icon-btn" data-close-modal aria-label="Close">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M18 6L6 18M6 6l12 12" />
+          </svg>
+        </button>
+      </div>
+      <div class="modal-body">
+        <div class="field">
+          <label>Password</label>
+          <input type="password" id="loginPassword" placeholder="Enter admin password" />
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn" data-close-modal>Cancel</button>
+        <button class="btn btn-primary" id="loginSubmitBtn">Log In</button>
+      </div>
+    </div>
+  </div>
+
   <div class="modal" id="promptModal" role="dialog" aria-modal="true">
     <div class="modal-card">
       <div class="modal-header">
@@ -1896,6 +1929,7 @@
         convos: load(LS.convos, []),
         presets: load(LS.presets, []),
         activeId: localStorage.getItem(LS.activeId) || null,
+        adminToken: localStorage.getItem('sgpt_adminToken') || null,
         models: [],         // list from /api/models
         modelInfo: {},        // cache: { "deepseek-r1:7b": { contextLength: 8192 } }
         streaming: false,
@@ -1927,11 +1961,43 @@
         try { localStorage.setItem(key, JSON.stringify(val)); }
         catch (e) { console.error('Save failed', key, e); toast('Storage full — could not save.'); }
       }
+      
+      let syncTimer = null;
+      function syncStateToServer() {
+        if (!state.adminToken) return;
+        clearTimeout(syncTimer);
+        syncTimer = setTimeout(async () => {
+          try {
+            const payload = { settings: state.settings, convos: state.convos, presets: state.presets, activeId: state.activeId };
+            const res = await fetch('/api/state', {
+              method: 'POST',
+              headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${state.adminToken}` },
+              body: JSON.stringify(payload)
+            });
+            if (res.status === 401) handleLogout();
+          } catch (e) { console.error('Failed to sync to server', e); }
+        }, 2000);
+      }
+
+      function handleLogout() {
+        state.adminToken = null;
+        localStorage.removeItem('sgpt_adminToken');
+        $('loginBtn').style.display = 'flex';
+        $('logoutBtn').style.display = 'none';
+        state.convos = []; // clear admin history from guest view
+        state.activeId = null;
+        persistAll();
+        renderSidebar();
+        renderActive();
+        toast('Logged out');
+      }
+
       function persistAll() {
         save(LS.settings, state.settings);
         save(LS.convos, state.convos);
         save(LS.presets, state.presets);
         if (state.activeId) localStorage.setItem(LS.activeId, state.activeId);
+        syncStateToServer();
       }
 
       /* ---------- Tiny utilities ---------- */
@@ -3101,7 +3167,65 @@
       function hideModal(id) { $(id).classList.remove('show'); }
 
       /* ---------- Wire up ---------- */
-      function init() {
+      async function init() {
+        // Handle auth load
+        if (state.adminToken) {
+          $('loginBtn').style.display = 'none';
+          $('logoutBtn').style.display = 'flex';
+          try {
+            const res = await fetch('/api/state', {
+              headers: { 'Authorization': `Bearer ${state.adminToken}` }
+            });
+            if (res.status === 401) {
+              handleLogout();
+            } else if (res.ok) {
+              const data = await res.json();
+              if (data.convos) {
+                state.settings = Object.assign(state.settings, data.settings || {});
+                state.convos = data.convos || [];
+                state.presets = data.presets || [];
+                if (data.activeId) state.activeId = data.activeId;
+                // Force sync down to localStorage
+                save(LS.settings, state.settings);
+                save(LS.convos, state.convos);
+                save(LS.presets, state.presets);
+                if (state.activeId) localStorage.setItem(LS.activeId, state.activeId);
+              }
+            }
+          } catch (e) {
+            console.error('Failed to load initial state', e);
+          }
+        }
+
+        // Login UI
+        $('loginBtn').addEventListener('click', () => showModal('loginModal'));
+        $('logoutBtn').addEventListener('click', handleLogout);
+        $('loginSubmitBtn').addEventListener('click', async () => {
+          const pwd = $('loginPassword').value;
+          $('loginSubmitBtn').disabled = true;
+          try {
+            const res = await fetch('/api/login', {
+              method: 'POST', headers: {'Content-Type': 'application/json'},
+              body: JSON.stringify({ password: pwd })
+            });
+            if (res.ok) {
+              const data = await res.json();
+              state.adminToken = data.token;
+              localStorage.setItem('sgpt_adminToken', data.token);
+              $('loginPassword').value = '';
+              hideModal('loginModal');
+              // Reload page to pull fresh state
+              window.location.reload();
+            } else {
+              toast('Invalid password');
+            }
+          } catch (e) {
+            toast('Login error');
+          } finally {
+            $('loginSubmitBtn').disabled = false;
+          }
+        });
+
         // Sidebar
         $('newChatBtn').addEventListener('click', () => newConvo());
         $('convoSearch').addEventListener('input', renderSidebar);
