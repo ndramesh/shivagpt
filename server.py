@@ -21,6 +21,9 @@ import io
 import json
 import logging
 import os
+import secrets
+import shutil
+import tempfile
 import time
 from pathlib import Path
 from typing import Any
@@ -52,6 +55,13 @@ else:
 
 OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434").rstrip("/")
 FRONTEND_DIR = Path(__file__).parent / "frontend"
+
+DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR.mkdir(parents=True, exist_ok=True)
+STATE_FILE = DATA_DIR / "state.json"
+
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
+ADMIN_TOKENS: set[str] = set()
 
 app = FastAPI(title="ShivaGPT", version="1.0.0")
 
@@ -599,6 +609,74 @@ async def process_image(req: Request) -> dict[str, Any]:
         "operation": operation,
         "size": len(result_bytes),
     }
+
+
+# ---------------------------------------------------------------------------
+# State Synchronization & Auth
+# ---------------------------------------------------------------------------
+
+@app.post("/api/login")
+async def login(req: Request) -> dict[str, str]:
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        
+    pwd = body.get("password")
+    if pwd == ADMIN_PASSWORD:
+        token = secrets.token_hex(32)
+        ADMIN_TOKENS.add(token)
+        log.info("Admin login successful. Token generated.")
+        return {"token": token}
+    
+    log.warning("Failed admin login attempt.")
+    raise HTTPException(status_code=401, detail="Invalid password")
+
+def _check_auth(req: Request):
+    auth = req.headers.get("Authorization")
+    if not auth or not auth.startswith("Bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid token")
+    token = auth.split(" ")[1]
+    if token not in ADMIN_TOKENS:
+        raise HTTPException(status_code=401, detail="Invalid token")
+
+@app.get("/api/state")
+async def get_state(req: Request) -> dict[str, Any]:
+    """Retrieve the application state from the backend (admin only)."""
+    _check_auth(req)
+    if not STATE_FILE.exists():
+        return {}
+    
+    try:
+        def _read():
+            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
+        return await asyncio.to_thread(_read)
+    except Exception as e:
+        log.error("Failed to read state.json: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to read state")
+
+@app.post("/api/state")
+async def save_state(req: Request) -> dict[str, bool]:
+    """Save the application state to the backend (admin only)."""
+    _check_auth(req)
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        
+    try:
+        def _write(data):
+            # Atomic write to prevent corruption
+            fd, tmp_path = tempfile.mkstemp(dir=DATA_DIR, prefix="state_", suffix=".tmp")
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp_path, STATE_FILE)
+            
+        await asyncio.to_thread(_write, body)
+        return {"ok": True}
+    except Exception as e:
+        log.error("Failed to write state.json: %s", e)
+        raise HTTPException(status_code=500, detail="Failed to save state")
 
 
 @app.post("/api/cancel/{model}")
