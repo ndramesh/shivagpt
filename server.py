@@ -462,10 +462,44 @@ def _process_image(img_bytes: bytes, operation: str, params: dict) -> tuple[byte
     had_alpha = img.mode == "RGBA"
 
     if operation == "upscale":
-        factor = int(params.get("factor", 2))
-        factor = max(1, min(factor, 8))
-        new_size = (img.width * factor, img.height * factor)
-        img = img.resize(new_size, Image.LANCZOS)
+        import subprocess
+        upscayl_bin = DATA_DIR / "upscayl" / "resources" / "bin" / "upscayl-bin"
+        models_dir = DATA_DIR / "upscayl" / "resources" / "models"
+        
+        if upscayl_bin.exists() and models_dir.exists():
+            log.info("Using Upscayl for AI upscaling...")
+            with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f_in, \
+                 tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f_out:
+                
+                img.save(f_in.name, format="PNG")
+                
+                cmd = [
+                    str(upscayl_bin),
+                    "-i", f_in.name,
+                    "-o", f_out.name,
+                    "-s", "2",
+                    "-m", str(models_dir),
+                    "-n", "remacri"
+                ]
+                try:
+                    subprocess.run(cmd, check=True, capture_output=True)
+                    img = Image.open(f_out.name)
+                    img.load()
+                except subprocess.CalledProcessError as e:
+                    log.error(f"Upscayl failed: {e.stderr.decode()}")
+                    raise ValueError("AI Upscaling failed")
+                finally:
+                    try:
+                        os.unlink(f_in.name)
+                        os.unlink(f_out.name)
+                    except OSError:
+                        pass
+        else:
+            log.warning("Upscayl not found, falling back to PIL Lanczos.")
+            factor = int(params.get("factor", 2))
+            factor = max(1, min(factor, 8))
+            new_size = (img.width * factor, img.height * factor)
+            img = img.resize(new_size, Image.LANCZOS)
 
     elif operation == "resize":
         w = int(params.get("width", img.width))
