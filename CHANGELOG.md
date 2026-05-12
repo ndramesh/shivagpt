@@ -5,6 +5,20 @@ All notable changes to ShivaGPT are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Inline Chart.js price charts in `/stock` and `/watchlist`.** The
+  1-month closing-price sparkline that `/stock` already returned is now
+  rendered as an actual line chart inside the message, color-coded by
+  net direction (green up, red down) with a tooltip on hover. Chart.js
+  loads from CDN; charts persist on the message and re-render after
+  reload. Same chart blocks appear per ticker in `/watchlist`.
+- **`/watchlist` slash command.** Track a list of tickers in
+  `localStorage`. Sub-commands: `/watchlist add NVDA AAPL TSLA`,
+  `/watchlist remove SYM`, `/watchlist clear`, `/watchlist` alone to
+  fetch quotes for everything in parallel and render a compact
+  dashboard with per-ticker trend charts. Pairs with `/stock <TICKER>`
+  for drill-downs.
+
+### Added
 - **`/tp` — ThinkOrSwim / Schwab portfolio (read-only).** New endpoint
   `POST /api/tp` reads your Schwab account (ToS got folded into Schwab
   in 2020) via the official Schwab Developer API. Returns balances
