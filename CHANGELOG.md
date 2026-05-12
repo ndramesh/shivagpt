@@ -4,6 +4,38 @@ All notable changes to ShivaGPT are documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **Stock market data layer (Alpaca + yfinance hybrid).** Real-time
+  quotes/bars from Alpaca (IEX feed on the free tier), supplemented with
+  fundamentals / analyst consensus / news from yfinance (which Alpaca
+  doesn't expose). Both run in parallel; each gracefully degrades if
+  the other is unavailable. Set `APCA_API_KEY_ID` and
+  `APCA_API_SECRET_KEY` in the systemd unit to enable real-time;
+  without them everything falls back to yfinance (delayed ~15 min).
+  Three new endpoints:
+    - `POST /api/stock/quote` — current price, daily change, day/52-week
+      range, market cap, P/E, EPS, dividend, beta, sector/industry, a
+      brief company summary, and a 1-month closing-price sparkline.
+    - `POST /api/stock/analysis` — hand-rolled RSI(14), MACD(12,26,9),
+      SMA-20/50/200, Bollinger Bands(20, 2σ). Each indicator is
+      translated into a textbook *reading* (overbought / uptrend / etc.)
+      with a short note about what traders traditionally take from it.
+      Plus analyst-consensus aggregate from Yahoo (mean rating, price
+      targets, Strong-Buy / Buy / Hold / Sell / Strong-Sell breakdown)
+      and recent news headlines.
+    - `POST /api/stock/options` — options chain near at-the-money with
+      bid/ask, volume, open interest, implied volatility. Also computes
+      payoff math (breakeven, max profit, max loss, premium) for a few
+      common strategies: covered call, cash-secured put, ATM bull-call
+      spread. Strategy math, not strategy recommendations.
+- **`/stock <ticker> [options]` slash command.** Fires the quote +
+  analysis (and options if requested) in parallel and renders a single
+  dashboard view with header card, fundamentals table, technical
+  readings, analyst consensus, options chain, strategy payoffs, and
+  recent news. Every panel labels its source; nothing the model "thinks"
+  is presented as a recommendation. Run again to refresh.
+- Requirements: `yfinance>=0.2.40`, `pandas>=2.0`.
+
 ### Changed
 - **`/imgen`: aspect ratio accepts `WxH` or `W:H`.** Earlier the parser
   only honored `:` and silently fell back to a square when given `x` —

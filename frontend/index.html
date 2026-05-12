@@ -2047,6 +2047,7 @@
         { name: '/codereview', desc: 'Review code from a URL, ssh path, or local folder', hasArgs: true, hint: '[-model X] <path>' },
         { name: '/search', desc: 'Web search (SearXNG) + cited answer', hasArgs: true, hint: '[-model X] <query>' },
         { name: '/fetch', desc: 'Fetch a URL and answer questions about it', hasArgs: true, hint: '<url> [question]' },
+        { name: '/stock', desc: 'Stock quote + technicals + analyst consensus (Yahoo Finance, ~15min delayed)', hasArgs: true, hint: '<ticker> [options]' },
       ];
 
       const BUILT_IN_PRESETS = [
@@ -3883,8 +3884,202 @@
             }, c, asst, contentEl, cursor, 'Fetching the page…');
             break;
           }
+
+          case '/stock': {
+            if (!args) {
+              toast('Usage: /stock <ticker> [options|news]');
+              break;
+            }
+            const parts = args.trim().split(/\s+/);
+            const ticker = (parts[0] || '').toUpperCase();
+            const subcommand = (parts[1] || '').toLowerCase();   // '', 'options', 'news'
+            if (!ticker) { toast('Missing <ticker>'); break; }
+            if (!c) c = newConvo();
+
+            c.messages.push({ role: 'user', content: `/stock ${args}`, ts: Date.now() });
+            autoTitleFromFirstUserMsg(c);
+            c.updatedAt = Date.now();
+            persistAll();
+            renderSidebar();
+            renderActive();
+
+            const loadingMsg = {
+              role: 'system',
+              content: `*Fetching ${ticker}${subcommand ? ' · ' + subcommand : ''}…*`,
+              ts: Date.now(),
+            };
+            c.messages.push(loadingMsg);
+            persistAll();
+            renderActive();
+            scrollToBottom();
+
+            try {
+              // Fire quote + analysis in parallel; options only if asked.
+              const promises = [
+                fetch(apiUrl('/api/stock/quote'), {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ ticker, period: '1mo' }),
+                }).then(r => r.ok ? r.json() : r.json().then(e => { throw new Error(e.detail || r.statusText); })),
+                fetch(apiUrl('/api/stock/analysis'), {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ ticker, period: '1y' }),
+                }).then(r => r.ok ? r.json() : r.json().then(e => { throw new Error(e.detail || r.statusText); })),
+              ];
+              if (subcommand === 'options') {
+                promises.push(fetch(apiUrl('/api/stock/options'), {
+                  method: 'POST',
+                  headers: { 'content-type': 'application/json' },
+                  body: JSON.stringify({ ticker, strikes_each_side: 6 }),
+                }).then(r => r.ok ? r.json() : r.json().then(e => { throw new Error(e.detail || r.statusText); })));
+              }
+              const results = await Promise.all(promises);
+              const quote = results[0], analysis = results[1], opts = results[2] || null;
+
+              const md = renderStockReport(quote, analysis, opts, subcommand);
+
+              const i = c.messages.indexOf(loadingMsg);
+              if (i >= 0) {
+                c.messages[i].content = md;
+                persistAll();
+                renderActive();
+                scrollToBottom();
+              }
+            } catch (e) {
+              console.error(e);
+              const i = c.messages.indexOf(loadingMsg);
+              if (i >= 0) {
+                c.messages[i].content = `*Failed to fetch **${ticker}**: ${e.message}*`;
+                persistAll();
+                renderActive();
+              }
+              toast('Stock fetch failed');
+            }
+            break;
+          }
         }
         return true;
+      }
+
+      // Render a stock dashboard as a single markdown blob. Kept inline as
+      // markdown (not custom DOM) so it works with our existing assignContent
+      // pipeline and re-renders cleanly when the message list does.
+      function renderStockReport(quote, analysis, opts, subcommand) {
+        const fmtMoney = (v, cur) => v == null ? 'n/a' :
+          ((cur || 'USD') === 'USD' ? '$' : (cur || '')) + Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
+        const fmtPct = v => v == null ? 'n/a' : (v >= 0 ? '+' : '') + Number(v).toFixed(2) + '%';
+        const fmtBig = v => {
+          if (v == null) return 'n/a';
+          const n = Math.abs(v);
+          if (n >= 1e12) return (v / 1e12).toFixed(2) + 'T';
+          if (n >= 1e9)  return (v / 1e9).toFixed(2)  + 'B';
+          if (n >= 1e6)  return (v / 1e6).toFixed(2)  + 'M';
+          if (n >= 1e3)  return (v / 1e3).toFixed(2)  + 'K';
+          return String(v);
+        };
+        const arrow = quote.change >= 0 ? '▲' : '▼';
+
+        // --- Header / quote card ---
+        let md = `## ${quote.name || quote.ticker} (\`${quote.ticker}\`)\n`;
+        md += `${fmtMoney(quote.price, quote.currency)}  **${arrow} ${fmtMoney(Math.abs(quote.change), quote.currency)} (${fmtPct(quote.change_pct)})**\n\n`;
+        if (quote.sector || quote.industry) {
+          md += `*${[quote.sector, quote.industry].filter(Boolean).join(' · ')}*  \n`;
+        }
+        md += `*${quote.exchange || ''} · ${quote.as_of}*\n\n`;
+
+        // --- Fundamentals table ---
+        md += `| | |\n|---|---|\n`;
+        md += `| Day range | ${fmtMoney(quote.day_low, quote.currency)} — ${fmtMoney(quote.day_high, quote.currency)} |\n`;
+        md += `| 52-week range | ${fmtMoney(quote.fifty_two_week_low, quote.currency)} — ${fmtMoney(quote.fifty_two_week_high, quote.currency)} |\n`;
+        md += `| Volume | ${fmtBig(quote.volume)} (avg ${fmtBig(quote.avg_volume)}) |\n`;
+        md += `| Market cap | ${fmtBig(quote.market_cap)} |\n`;
+        md += `| P/E (trailing · forward) | ${quote.pe_ratio?.toFixed?.(1) ?? 'n/a'} · ${quote.forward_pe?.toFixed?.(1) ?? 'n/a'} |\n`;
+        md += `| EPS · Dividend yield | ${quote.eps ?? 'n/a'} · ${quote.dividend_yield != null ? (quote.dividend_yield * 100).toFixed(2) + '%' : 'n/a'} |\n`;
+        md += `| Beta | ${quote.beta?.toFixed?.(2) ?? 'n/a'} |\n\n`;
+
+        // --- Technical readings ---
+        if (analysis && analysis.readings && analysis.readings.length) {
+          md += `### Technicals (${analysis.period})\n\n`;
+          for (const r of analysis.readings) {
+            md += `- **${r.name}** — ${r.reading}${r.value != null ? ` (${r.value})` : ''}. ${r.note}\n`;
+          }
+          md += '\n';
+        }
+
+        // --- Analyst consensus (Wall Street, NOT generated here) ---
+        if (analysis && analysis.analyst_consensus) {
+          const a = analysis.analyst_consensus;
+          const labelMap = { strongBuy: 'Strong Buy', buy: 'Buy', hold: 'Hold', sell: 'Sell', strongSell: 'Strong Sell' };
+          const s = a.latest_summary;
+          if (s || a.mean_rating || a.target_mean_price) {
+            md += `### Analyst consensus — *Wall Street, via Yahoo*\n\n`;
+            if (a.mean_rating != null && a.recommendation_key) {
+              md += `- Mean rating: **${a.recommendation_key}** (${a.mean_rating.toFixed?.(2) ?? a.mean_rating} on 1=Strong Buy → 5=Strong Sell scale)`;
+              if (a.number_of_analysts) md += `, n=${a.number_of_analysts}`;
+              md += `\n`;
+            }
+            if (a.target_mean_price != null) {
+              md += `- Mean price target: **${fmtMoney(a.target_mean_price, quote.currency)}** `;
+              md += `(low ${fmtMoney(a.target_low_price, quote.currency)} · high ${fmtMoney(a.target_high_price, quote.currency)})\n`;
+              const pctVsTarget = (a.target_mean_price - quote.price) / quote.price * 100;
+              md += `  — current price implies ${pctVsTarget >= 0 ? '+' : ''}${pctVsTarget.toFixed(1)}% to the mean target\n`;
+            }
+            if (s) {
+              const labels = Object.keys(labelMap).filter(k => s[k] != null);
+              if (labels.length) {
+                md += `- Breakdown: ${labels.map(k => `${labelMap[k]} ${s[k]}`).join(' · ')}\n`;
+              }
+            }
+            md += `\n_Reminder: this is a third-party aggregate. Not a recommendation from ShivaGPT._\n\n`;
+          }
+        }
+
+        // --- Options (if requested) ---
+        if (opts && opts.calls && opts.puts) {
+          md += `### Options · expiry **${opts.expiry}**\n\n`;
+          md += `Spot **${fmtMoney(opts.current_price, quote.currency)}**. Showing ~${Math.floor(opts.calls.length / 2)} strikes each side of ATM.\n\n`;
+          md += `**Calls**\n\n`;
+          md += `| Strike | Bid | Ask | Last | Vol | OI | IV |\n|---:|---:|---:|---:|---:|---:|---:|\n`;
+          for (const r of opts.calls) {
+            md += `| ${r.strike} | ${r.bid ?? '-'} | ${r.ask ?? '-'} | ${r.lastPrice ?? '-'} | ${r.volume ?? '-'} | ${r.openInterest ?? '-'} | ${r.impliedVolatility != null ? (r.impliedVolatility * 100).toFixed(1) + '%' : '-'} |\n`;
+          }
+          md += `\n**Puts**\n\n`;
+          md += `| Strike | Bid | Ask | Last | Vol | OI | IV |\n|---:|---:|---:|---:|---:|---:|---:|\n`;
+          for (const r of opts.puts) {
+            md += `| ${r.strike} | ${r.bid ?? '-'} | ${r.ask ?? '-'} | ${r.lastPrice ?? '-'} | ${r.volume ?? '-'} | ${r.openInterest ?? '-'} | ${r.impliedVolatility != null ? (r.impliedVolatility * 100).toFixed(1) + '%' : '-'} |\n`;
+          }
+          if (opts.strategies && opts.strategies.length) {
+            md += `\n### Strategy math — *not a recommendation, just the numbers*\n\n`;
+            for (const s of opts.strategies) {
+              md += `**${s.name}** — ${s.description}\n\n`;
+              if (s.premium_collected != null) md += `- Premium collected: **${fmtMoney(s.premium_collected, quote.currency)}**\n`;
+              if (s.net_debit != null) md += `- Net debit: **${fmtMoney(s.net_debit, quote.currency)}**\n`;
+              if (s.breakeven != null) md += `- Breakeven: **${fmtMoney(s.breakeven, quote.currency)}**\n`;
+              if (s.max_profit != null) md += `- Max profit: **${typeof s.max_profit === 'number' ? fmtMoney(s.max_profit, quote.currency) : s.max_profit}**\n`;
+              if (s.max_loss != null) md += `- Max loss: **${typeof s.max_loss === 'number' ? fmtMoney(s.max_loss, quote.currency) : s.max_loss}**\n`;
+              if (s.best_if) md += `- Works best if: ${s.best_if}\n`;
+              md += '\n';
+            }
+          }
+        }
+
+        // --- News ---
+        if (analysis && analysis.news && analysis.news.length) {
+          md += `### Recent news\n\n`;
+          for (const n of analysis.news.slice(0, 6)) {
+            const pub = n.publisher ? ` *(${n.publisher})*` : '';
+            md += `- [${n.title}](${n.link || '#'})${pub}\n`;
+          }
+          md += '\n';
+        }
+
+        // --- Footer / disclaimer ---
+        md += `---\n\n`;
+        md += quote.disclaimer || '';
+        md += `\n\nTry: \`/stock ${quote.ticker} options\` for the chain + strategy math. `;
+        md += `Run again to refresh.`;
+        return md;
       }
 
       // Generic NDJSON streamer used by /search and /fetch. Mirrors streamChat
