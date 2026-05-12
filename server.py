@@ -1304,11 +1304,26 @@ async def _searxng_search(query: str, num: int) -> list[dict]:
 
 
 async def _fetch_one(url: str, max_chars: int) -> tuple[str, str]:
-    """Returns (title, text). Title comes from <title>; text is main content."""
+    """Returns (title, text). Title comes from <title>; text is main content.
+
+    Uses a real-browser UA because many sites (WhitePages, LinkedIn, news
+    sites behind anti-scraper services) reject obviously non-browser
+    requests with 403/999. Override with FETCH_USER_AGENT env if you want
+    something more honest at the cost of getting blocked more often.
+    """
+    ua = os.getenv(
+        "FETCH_USER_AGENT",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_2_1) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Safari/605.1.15",
+    )
     async with httpx.AsyncClient(
         timeout=FETCH_TIMEOUT_S,
         follow_redirects=True,
-        headers={"User-Agent": "shivagpt-fetch/1.0 (+private LAN assistant)"},
+        headers={
+            "User-Agent": ua,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        },
     ) as cli:
         r = await cli.get(url)
         r.raise_for_status()
@@ -1436,28 +1451,76 @@ async def web_search(req: Request) -> StreamingResponse:
         raise HTTPException(status_code=502,
                             detail=f"SearXNG returned no results for {query!r}")
 
-    # 2. Fetch the top-N page texts (best-effort; failures are skipped silently)
+    # 2. Fetch the top-N page texts (best-effort; failures get surfaced in the
+    #    preamble so the user knows when the answer is snippet-only).
     pages: list[dict] = []
+    fetch_outcomes: list[dict] = []  # one per attempted URL
     if fetch_top > 0:
-        async def _maybe_fetch(i: int, r: dict):
+        async def _maybe_fetch(i: int, r: dict) -> dict:
             try:
                 title, text = await _fetch_one(r["url"], SEARCH_FETCH_MAX_CHARS)
-                return {"index": i, "title": title or r["title"], "url": r["url"], "text": text}
+                return {"i": i, "url": r["url"], "title": title or r["title"],
+                        "ok": True, "text": text}
+            except HTTPException as e:
+                # Our own exception with a clean detail (e.g. 415 content-type)
+                return {"i": i, "url": r["url"], "title": r["title"],
+                        "ok": False, "reason": f"{e.status_code}: {e.detail[:80]}"}
+            except httpx.HTTPStatusError as e:
+                code = e.response.status_code
+                label = {403: "blocked (403)", 999: "blocked (LinkedIn 999)",
+                         429: "rate-limited (429)", 401: "auth required (401)"}.get(
+                    code, f"HTTP {code}")
+                return {"i": i, "url": r["url"], "title": r["title"],
+                        "ok": False, "reason": label}
+            except (httpx.ConnectError, httpx.ReadTimeout, httpx.ConnectTimeout):
+                return {"i": i, "url": r["url"], "title": r["title"],
+                        "ok": False, "reason": "timed out"}
             except Exception as e:
-                log.debug("search: skip fetch %s: %s", r["url"], e)
-                return None
-        fetched = await asyncio.gather(*[_maybe_fetch(i + 1, r) for i, r in enumerate(results[:fetch_top])])
-        pages = [p for p in fetched if p]
+                return {"i": i, "url": r["url"], "title": r["title"],
+                        "ok": False, "reason": f"{e.__class__.__name__}: {str(e)[:60]}"}
+        fetch_outcomes = await asyncio.gather(
+            *[_maybe_fetch(i + 1, r) for i, r in enumerate(results[:fetch_top])]
+        )
+        for o in fetch_outcomes:
+            if o["ok"]:
+                pages.append({"index": o["i"], "title": o["title"],
+                              "url": o["url"], "text": o["text"]})
+            else:
+                log.debug("search: skip fetch %s: %s", o["url"], o["reason"])
 
     system, user = _build_search_prompt(query, results, pages, instructions)
 
-    # Preamble shows the user what was found before any tokens stream in.
-    preview_lines = "\n".join(
-        f"  [{i+1}] [{r['title']}]({r['url']})" + (f"  · _{r['engine']}_" if r.get("engine") else "")
-        for i, r in enumerate(results)
-    )
-    fetched_note = (f"_Fetched full text of **{len(pages)}** result(s)._\n\n"
-                    if pages else "_No full-text fetch; using snippets only._\n\n")
+    # Preamble shows the user what was found before any tokens stream in,
+    # marking each top-fetch result with a ✓ (got page text) or ✗ (blocked /
+    # empty / timed out) plus reason so they know when an answer is
+    # snippet-only.
+    outcome_by_idx = {o["i"]: o for o in fetch_outcomes}  # 1-indexed
+    def _line(i: int, r: dict) -> str:
+        idx = i + 1
+        o = outcome_by_idx.get(idx)
+        if o is None:
+            marker = ""                       # not in fetch_top window
+        elif o["ok"]:
+            marker = " ✓"
+        else:
+            marker = f" ✗ _{o['reason']}_"
+        engine = f"  · _{r['engine']}_" if r.get("engine") else ""
+        return f"  [{idx}] [{r['title']}]({r['url']}){engine}{marker}"
+    preview_lines = "\n".join(_line(i, r) for i, r in enumerate(results))
+
+    n_ok = len(pages)
+    n_fail = sum(1 for o in fetch_outcomes if not o["ok"])
+    if n_ok and n_fail:
+        fetched_note = (f"_Got full text from **{n_ok}** result(s); **{n_fail}** "
+                        f"blocked or empty (using snippets for those)._\n\n")
+    elif n_ok:
+        fetched_note = f"_Got full text from **{n_ok}** result(s)._\n\n"
+    elif n_fail:
+        fetched_note = (f"_All **{n_fail}** top result(s) were blocked/empty — "
+                        f"answering from snippets only._\n\n")
+    else:
+        fetched_note = "_Snippets-only mode (no full-text fetch)._\n\n"
+
     preamble = (
         f"_Searching for **{query}** via SearXNG · model `{model}`…_\n\n"
         f"<details><summary>Search results</summary>\n\n{preview_lines}\n\n</details>\n\n"

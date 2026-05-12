@@ -5,6 +5,22 @@ All notable changes to ShivaGPT are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **DeepSeek-R1 / QwQ-style `<think>` block UI** — reasoning models that
+  emit a `<think>…</think>` block before the answer now render that block
+  as a collapsible widget at the top of the assistant message
+  ("💭 Thought for 8s ▾"), expanded while streaming and collapsed when
+  done. `<think>` content is stripped from history before sending the
+  next turn to Ollama so it doesn't keep eating context.
+- **Conversation search match previews** — typing in the sidebar search
+  box now shows a snippet of the matching message under each conversation
+  title, with the matched substring highlighted. (The filter itself was
+  already there; this surfaces *why* each result matched.)
+- **Edit and resend user messages** — every user message gets an "Edit"
+  button. Clicking it loads the text back into the composer and discards
+  the message + everything after it (with a confirm prompt), so typos
+  and reframes don't require starting a new conversation.
+
+### Added
 - **`/search` slash command** — web search backed by SearXNG running on
   the same host. Streams a cited answer that grounds the model in
   fresh web results. Fetches the top-N pages' main article text (via

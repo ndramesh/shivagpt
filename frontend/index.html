@@ -241,6 +241,37 @@
       display: flex;
     }
 
+    /* When a sidebar search matches, the convo item grows a 2nd line
+       previewing the matching snippet under the title. */
+    .convo-item.has-match {
+      flex-wrap: wrap;
+      align-items: flex-start;
+      padding-bottom: 10px;
+    }
+    .convo-item.has-match .convo-title { flex: 1 1 auto; }
+    .convo-item.has-match .convo-actions { flex: 0 0 auto; }
+    .convo-match {
+      flex: 1 0 100%;
+      font-size: 12px;
+      color: var(--text-3);
+      line-height: 1.35;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+      margin-top: 2px;
+    }
+    .convo-match-role {
+      color: var(--text-3);
+      font-style: italic;
+      margin-right: 2px;
+    }
+    .convo-match-hit {
+      background: var(--accent-soft, rgba(124, 92, 255, 0.25));
+      color: var(--text-1);
+      padding: 0 2px;
+      border-radius: 2px;
+    }
+
     .icon-btn {
       background: transparent;
       border: none;
@@ -608,6 +639,52 @@
 
     .msg-content th {
       background: var(--bg-elev-2);
+    }
+
+    /* Reasoning-model "<think>...</think>" block, rendered as a collapsible
+       widget at the top of the assistant message. */
+    .think-block {
+      margin: 0 0 10px 0;
+      padding: 6px 10px 6px 10px;
+      background: var(--bg-elev-2);
+      border-left: 3px solid var(--border-strong);
+      border-radius: 6px;
+      font-size: 13px;
+      color: var(--text-2);
+    }
+    .think-block summary {
+      cursor: pointer;
+      color: var(--text-3);
+      list-style: none;
+      user-select: none;
+      font-style: italic;
+      padding: 1px 0;
+    }
+    .think-block summary::-webkit-details-marker { display: none; }
+    .think-block summary::before {
+      content: "▸ ";
+      display: inline-block;
+      width: 1em;
+      transition: transform 0.15s ease;
+    }
+    .think-block[open] summary::before {
+      content: "▾ ";
+    }
+    .think-block .think-body {
+      margin-top: 8px;
+      padding-top: 8px;
+      border-top: 1px dashed var(--border);
+      white-space: pre-wrap;
+      font-family: "SF Mono", ui-monospace, "Menlo", "Monaco", monospace;
+      font-size: 12px;
+      color: var(--text-2);
+      max-height: 320px;
+      overflow-y: auto;
+    }
+    .think-block.streaming summary::after {
+      content: " (thinking…)";
+      color: var(--accent, #7c5cff);
+      font-style: normal;
     }
 
     .code-block {
@@ -2273,16 +2350,46 @@
       }
 
       /* ---------- Rendering: sidebar ---------- */
+      // Find the first message whose content matches `q` (case-insensitive)
+      // and return a short snippet around the match with the matched range,
+      // for the sidebar preview line.
+      function _findConvoMatch(c, q) {
+        if (!q) return null;
+        for (let i = 0; i < c.messages.length; i++) {
+          const m = c.messages[i];
+          const text = m.content || '';
+          const idx = text.toLowerCase().indexOf(q);
+          if (idx < 0) continue;
+          const radius = 35;
+          const start = Math.max(0, idx - radius);
+          const end = Math.min(text.length, idx + q.length + radius);
+          const before = (start > 0 ? '…' : '') + text.slice(start, idx);
+          const matched = text.slice(idx, idx + q.length);
+          const after = text.slice(idx + q.length, end) + (end < text.length ? '…' : '');
+          return { messageIndex: i, role: m.role, before, matched, after };
+        }
+        return null;
+      }
+
       function renderSidebar() {
         const list = $('convoList');
         list.innerHTML = '';
         const q = ($('convoSearch').value || '').toLowerCase().trim();
-        const filtered = q
-          ? state.convos.filter((c) =>
-            (c.title || '').toLowerCase().includes(q) ||
-            c.messages.some((m) => (m.content || '').toLowerCase().includes(q))
-          )
-          : state.convos.slice();
+        let filtered;
+        const matchByConvo = new Map();   // convo.id -> snippet info
+        if (q) {
+          filtered = [];
+          for (const c of state.convos) {
+            const titleMatch = (c.title || '').toLowerCase().includes(q);
+            const snippet = _findConvoMatch(c, q);
+            if (titleMatch || snippet) {
+              filtered.push(c);
+              if (snippet) matchByConvo.set(c.id, snippet);
+            }
+          }
+        } else {
+          filtered = state.convos.slice();
+        }
         filtered.sort((a, b) => b.updatedAt - a.updatedAt);
         const groups = groupConvos(filtered);
         let any = false;
@@ -2291,32 +2398,48 @@
           any = true;
           list.appendChild(el('div', { class: 'convo-group-label' }, label));
           for (const c of items) {
+            const snippet = matchByConvo.get(c.id);
+            const titleRow = el('span', { class: 'convo-title', title: c.title }, c.title);
+            const actions = el('span', { class: 'convo-actions' },
+              el('button', {
+                class: 'icon-btn', title: 'Rename',
+                onclick: (ev) => {
+                  ev.stopPropagation();
+                  const next = prompt('Rename conversation', c.title);
+                  if (next != null) renameConvo(c.id, next.trim());
+                },
+                html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4z"/></svg>'
+              }),
+              el('button', {
+                class: 'icon-btn', title: 'Delete',
+                onclick: (ev) => {
+                  ev.stopPropagation();
+                  if (confirm('Delete this conversation?')) deleteConvo(c.id);
+                },
+                html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>'
+              }),
+            );
+
             const item = el('div',
               {
-                class: 'convo-item' + (c.id === state.activeId ? ' active' : ''),
+                class: 'convo-item' + (c.id === state.activeId ? ' active' : '') +
+                       (snippet ? ' has-match' : ''),
                 onclick: (ev) => { if (!ev.target.closest('.convo-actions')) activateConvo(c.id); }
               },
-              el('span', { class: 'convo-title', title: c.title }, c.title),
-              el('span', { class: 'convo-actions' },
-                el('button', {
-                  class: 'icon-btn', title: 'Rename',
-                  onclick: (ev) => {
-                    ev.stopPropagation();
-                    const next = prompt('Rename conversation', c.title);
-                    if (next != null) renameConvo(c.id, next.trim());
-                  },
-                  html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 20h9M16.5 3.5a2.121 2.121 0 1 1 3 3L7 19l-4 1 1-4z"/></svg>'
-                }),
-                el('button', {
-                  class: 'icon-btn', title: 'Delete',
-                  onclick: (ev) => {
-                    ev.stopPropagation();
-                    if (confirm('Delete this conversation?')) deleteConvo(c.id);
-                  },
-                  html: '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="3 6 5 6 21 6"/><path d="M19 6l-2 14a2 2 0 0 1-2 2H9a2 2 0 0 1-2-2L5 6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>'
-                }),
-              ),
+              titleRow,
+              actions,
             );
+
+            if (snippet) {
+              const preview = el('span', { class: 'convo-match' },
+                el('span', { class: 'convo-match-role' },
+                  snippet.role === 'user' ? 'You: ' : 'AI: '),
+                document.createTextNode(snippet.before),
+                el('mark', { class: 'convo-match-hit' }, snippet.matched),
+                document.createTextNode(snippet.after),
+              );
+              item.appendChild(preview);
+            }
             list.appendChild(item);
           }
         }
@@ -2470,7 +2593,7 @@
         const content = el('div', { class: 'msg-content' });
         content.dataset.role = m.role;
         content.dataset.raw = '';   // we update via assignContent
-        assignContent(content, m.content || '', !isUser);
+        assignContent(content, m.content || '', !isUser, m);
 
         // Show attachment indicators for user messages with files
         if (m.attachments && m.attachments.length) {
@@ -2507,6 +2630,13 @@
           title: 'Copy message',
           onclick: () => { navigator.clipboard.writeText(m.content || ''); toast('Copied'); },
         }, 'Copy'));
+        if (isUser) {
+          actions.appendChild(el('button', {
+            class: 'icon-btn',
+            title: 'Edit and resend — drops any messages after this one',
+            onclick: () => editUserMessage(m),
+          }, 'Edit'));
+        }
         if (!isSys) {
           actions.appendChild(el('button', {
             class: 'icon-btn',
@@ -2568,23 +2698,114 @@
         }
       }
 
-      function assignContent(contentEl, raw, asMarkdown) {
-        contentEl.dataset.raw = raw;
-        if (!asMarkdown) {
-          contentEl.textContent = raw;
-          return;
+      // Reasoning models (DeepSeek-R1 family, QwQ, etc.) emit a <think>...</think>
+      // block before the visible answer. Split it out so we can render it as a
+      // collapsible widget, and so it doesn't get fed back into future prompts.
+      function splitThinking(raw) {
+        const s = raw || '';
+        if (!s.startsWith('<think>') && s.indexOf('<think>') < 0) {
+          return { thinking: '', answer: s, streaming: false, hasThink: false };
         }
-        try {
-          if (window.marked) {
-            marked.setOptions({ breaks: true, gfm: true });
-            contentEl.innerHTML = marked.parse(raw || '');
-            enhanceCodeBlocks(contentEl);
-          } else {
+        // Find the first <think> and its (possibly missing) </think>.
+        const openIdx = s.indexOf('<think>');
+        const closeIdx = s.indexOf('</think>', openIdx + 7);
+        if (closeIdx < 0) {
+          // Still streaming the thinking — no answer yet (anything before
+          // the open tag was probably a stray whitespace token).
+          return {
+            thinking: s.slice(openIdx + 7),
+            answer: s.slice(0, openIdx).trim(),  // usually empty
+            streaming: true,
+            hasThink: true,
+          };
+        }
+        const thinking = s.slice(openIdx + 7, closeIdx);
+        const before = s.slice(0, openIdx).trim();   // usually empty
+        const after = s.slice(closeIdx + 8).replace(/^\s+/, '');
+        return {
+          thinking,
+          answer: before + (before && after ? '\n\n' : '') + after,
+          streaming: false,
+          hasThink: true,
+        };
+      }
+
+      function stripThinking(s) {
+        return (s || '').replace(/<think>[\s\S]*?<\/think>\s*/g, '').replace(/<think>[\s\S]*$/, '');
+      }
+
+      function _fmtThinkSummary(m, parts) {
+        if (parts.streaming) return '💭 Thinking…';
+        const secs = m && m.thinkingSeconds;
+        if (secs && secs > 0) return `💭 Thought for ${secs < 1 ? secs.toFixed(1) : Math.round(secs)}s`;
+        return '💭 Reasoning';
+      }
+
+      function assignContent(contentEl, raw, asMarkdown, msg) {
+        contentEl.dataset.raw = raw;
+
+        // Read the message reference off the DOM if not passed; needed so
+        // we can show "Thought for Ns" using msg.thinkingSeconds.
+        if (!msg) {
+          try { msg = contentEl.__msg; } catch (e) { /* not bound */ }
+        } else {
+          contentEl.__msg = msg;
+        }
+
+        const parts = splitThinking(raw);
+        if (!asMarkdown || !parts.hasThink) {
+          // Original simple path — user messages, system messages, or
+          // assistant messages without any <think> block.
+          if (!asMarkdown) {
+            contentEl.textContent = raw;
+            return;
+          }
+          try {
+            if (window.marked) {
+              marked.setOptions({ breaks: true, gfm: true });
+              contentEl.innerHTML = marked.parse(raw || '');
+              enhanceCodeBlocks(contentEl);
+            } else {
+              contentEl.textContent = raw;
+            }
+          } catch (e) {
             contentEl.textContent = raw;
           }
-        } catch (e) {
-          contentEl.textContent = raw;
+          return;
         }
+
+        // Assistant message that contains a <think> block: render the
+        // collapsible thinking widget above the (possibly empty) answer.
+        contentEl.innerHTML = '';
+        const det = document.createElement('details');
+        det.className = 'think-block' + (parts.streaming ? ' streaming' : '');
+        // Auto-expanded while streaming so the user can watch it think;
+        // collapsed once done so the answer is what you see by default.
+        if (parts.streaming) det.open = true;
+        const sum = document.createElement('summary');
+        sum.textContent = _fmtThinkSummary(msg, parts);
+        det.appendChild(sum);
+        const body = document.createElement('div');
+        body.className = 'think-body';
+        body.textContent = parts.thinking;
+        det.appendChild(body);
+        contentEl.appendChild(det);
+
+        // Render the visible answer (if any) below the thinking block.
+        const answerEl = document.createElement('div');
+        answerEl.className = 'msg-answer';
+        try {
+          if (window.marked && parts.answer) {
+            marked.setOptions({ breaks: true, gfm: true });
+            answerEl.innerHTML = marked.parse(parts.answer);
+            enhanceCodeBlocks(answerEl);
+          } else {
+            answerEl.textContent = parts.answer || '';
+          }
+        } catch (e) {
+          answerEl.textContent = parts.answer || '';
+        }
+        contentEl.appendChild(answerEl);
       }
 
       function enhanceCodeBlocks(root) {
@@ -2930,12 +3151,25 @@
         }
         for (const m of c.messages) {
           if (m.role === 'system') continue;
-          const msg = { role: m.role, content: m.content };
+          // Strip <think>...</think> from prior assistant turns so the model
+          // doesn't keep re-ingesting (and getting confused by) its own past
+          // reasoning. The visible answer is what carries forward.
+          const content = m.role === 'assistant' ? stripThinking(m.content) : m.content;
+          const msg = { role: m.role, content };
           // Pass images array to Ollama for vision models
           if (m.images && m.images.length) msg.images = m.images;
           msgs.push(msg);
         }
         return msgs;
+      }
+
+      // Record how long the model spent in its <think> block. Called from
+      // every streaming loop after each piece is appended. Runs at most once
+      // per assistant message (the first time </think> appears).
+      function _maybeMarkThinkingDone(assistantMsg) {
+        if (!assistantMsg || assistantMsg.thinkingSeconds) return;
+        if (!assistantMsg.content || assistantMsg.content.indexOf('</think>') < 0) return;
+        assistantMsg.thinkingSeconds = (Date.now() - (assistantMsg.ts || Date.now())) / 1000;
       }
 
       async function streamChat(convo, assistantMsg, contentEl, cursorEl) {
@@ -3001,9 +3235,10 @@
               const piece = (obj.message && obj.message.content) || '';
               if (piece) {
                 assistantMsg.content += piece;
+                _maybeMarkThinkingDone(assistantMsg);
                 // re-render content (preserve cursor)
                 if (cursorEl.parentNode === contentEl) contentEl.removeChild(cursorEl);
-                assignContent(contentEl, assistantMsg.content, true);
+                assignContent(contentEl, assistantMsg.content, true, assistantMsg);
                 contentEl.appendChild(cursorEl);
                 scrollToBottom();
               }
@@ -3081,6 +3316,36 @@
       }
 
       function clamp(n, lo, hi) { return Math.max(lo, Math.min(hi, Number(n) || 0)); }
+
+      // Load a user message back into the composer and drop it (and
+       // everything after) from the conversation, so the user can tweak and
+       // resend. Like ChatGPT's "edit message" — fixes typos, refines a
+       // prompt, or forks the convo from any earlier point.
+      function editUserMessage(userMsg) {
+        const c = getActive();
+        if (!c) return;
+        const idx = c.messages.indexOf(userMsg);
+        if (idx < 0) return;
+        const droppedAfter = c.messages.length - idx - 1;
+        if (droppedAfter > 0) {
+          const noun = droppedAfter === 1 ? 'message' : 'messages';
+          if (!confirm(`Editing this message will discard the ${droppedAfter} ${noun} after it. Continue?`)) return;
+        }
+        const text = userMsg.content || '';
+        // Truncate from this user message onward.
+        c.messages.splice(idx);
+        c.updatedAt = Date.now();
+        persistAll();
+        renderSidebar();
+        renderActive();
+
+        const ta = $('composer');
+        ta.value = text;
+        autoSize(ta);
+        ta.focus();
+        try { ta.setSelectionRange(text.length, text.length); } catch (e) { /* iOS quirk */ }
+        toast('Loaded for editing — Enter to resend');
+      }
 
       async function regenerate(assistantMsg) {
         const c = getActive(); if (!c) return;
@@ -3624,8 +3889,9 @@
               const piece = (obj.message && obj.message.content) || '';
               if (piece) {
                 assistantMsg.content += piece;
+                _maybeMarkThinkingDone(assistantMsg);
                 if (cursorEl.parentNode === contentEl) contentEl.removeChild(cursorEl);
-                assignContent(contentEl, assistantMsg.content, true);
+                assignContent(contentEl, assistantMsg.content, true, assistantMsg);
                 contentEl.appendChild(cursorEl);
                 scrollToBottom();
               }
@@ -3715,8 +3981,9 @@
               const piece = (obj.message && obj.message.content) || '';
               if (piece) {
                 assistantMsg.content += piece;
+                _maybeMarkThinkingDone(assistantMsg);
                 if (cursorEl.parentNode === contentEl) contentEl.removeChild(cursorEl);
-                assignContent(contentEl, assistantMsg.content, true);
+                assignContent(contentEl, assistantMsg.content, true, assistantMsg);
                 contentEl.appendChild(cursorEl);
                 scrollToBottom();
               }
