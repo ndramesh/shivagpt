@@ -142,6 +142,61 @@ the model, temperature, or system prompt for the current chat without
 touching your defaults. Pick a preset from the prompt-library button (the
 notebook icon).
 
+## Code review (`/codereview`)
+
+Type a slash command in the composer to review code from anywhere:
+
+```
+/codereview git@github.com:ndramesh/shivagpt.git
+/codereview https://github.com/ndramesh/shivagpt/blob/main/server.py
+/codereview -model qwen2.5-coder:7b shiva@kailash:/home/shiva/some-project
+/codereview /home/shiva/some-local-folder   focus on error handling
+```
+
+How the path is interpreted (first match wins):
+
+1. `git@github.com:owner/repo[.git]` — SSH-style git remote, routed to
+   the GitHub fetcher (not literal SSH).
+2. `https://github.com/owner/repo[/blob/branch/path | /tree/branch[/sub]]`
+   — uses the GitHub Tree API + raw fetches. Honors `GITHUB_TOKEN`.
+3. Any other `http(s)://` — fetched as a single text blob (gist raw, etc.).
+4. `user@host:/path` — `ssh -o BatchMode=yes` (key-based auth only),
+   enumerates with `find`, then batched `cat` in one round trip.
+5. Anything else — local path on whatever host is running the proxy
+   (i.e. the DGX).
+
+The review streams into the chat with a markdown preamble listing every
+file that was bundled. Files are filtered to common source/text
+extensions and the usual junk dirs (`node_modules`, `__pycache__`,
+`.git`, `venv`, `dist`, …) are skipped. Caps default to **30 files** and
+**120 000 characters**; tune via env vars below.
+
+**Auth requirement.** The endpoint is gated behind the admin token
+(same one `/api/state` uses) because it can read arbitrary filesystem
+paths and exec `ssh`. Run `/login` once and the token sticks in
+localStorage. The frontend will toast *"Admin login required"* if you
+forgot.
+
+Env vars (set in `install-service.sh` or `sudo systemctl edit shivagpt`):
+
+- `CODEREVIEW_DEFAULT_MODEL` — used when `-model` isn't passed. Default
+  `deepseek-coder-v2`. Override to whatever you've pulled on Ollama.
+- `CODEREVIEW_MAX_FILES` — cap on files bundled into one review. Default 30.
+- `CODEREVIEW_MAX_CHARS` — total character budget. Default 120 000.
+- `GITHUB_TOKEN` — optional; bumps GitHub rate limits and unlocks
+  private repos.
+- `ADMIN_PASSWORD` — what `/api/login` checks. Default is `ndr123`, so
+  **set this** before exposing the service to the network.
+
+If you use the `user@host:/path` form: the systemd unit ships with
+`ProtectHome=read-only`, which means `ssh` inside the service can read
+keys but can't write `known_hosts`. Pre-seed any hosts you'll review
+from once:
+
+```bash
+ssh kailash 'ssh-keyscan -H your-other-box >> ~/.ssh/known_hosts'
+```
+
 ## Streaming behavior
 
 Tokens append as they arrive. If the first token takes more than 4.5

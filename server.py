@@ -21,12 +21,16 @@ import io
 import json
 import logging
 import os
+import re
 import secrets
+import shlex
 import shutil
+import subprocess
 import tempfile
 import time
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx
 from fastapi import FastAPI, File, HTTPException, Request, UploadFile
@@ -60,8 +64,11 @@ DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(parents=True, exist_ok=True)
 STATE_FILE = DATA_DIR / "state.json"
 
-ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ndr123")
 ADMIN_TOKENS: set[str] = set()
+
+# Global for diffusers lazy-loading
+_imgen_pipeline = None
 
 app = FastAPI(title="ShivaGPT", version="1.0.0")
 
@@ -462,7 +469,6 @@ def _process_image(img_bytes: bytes, operation: str, params: dict) -> tuple[byte
     had_alpha = img.mode == "RGBA"
 
     if operation == "upscale":
-        import subprocess
         upscayl_bin = DATA_DIR / "upscayl" / "resources" / "bin" / "upscayl-bin"
         models_dir = DATA_DIR / "upscayl" / "resources" / "models"
         
@@ -646,6 +652,75 @@ async def process_image(req: Request) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Image Generation (/api/imgen)
+# ---------------------------------------------------------------------------
+
+def _get_imgen_pipeline():
+    global _imgen_pipeline
+    if _imgen_pipeline is None:
+        log.info("Loading diffusers pipeline (this will take a while)...")
+        import torch
+        from diffusers import AutoPipelineForText2Image
+        # Full SDXL Base 1.0 for high quality
+        _imgen_pipeline = AutoPipelineForText2Image.from_pretrained(
+            "stabilityai/stable-diffusion-xl-base-1.0",
+            torch_dtype=torch.float16,
+            variant="fp16",
+            use_safetensors=True
+        )
+        _imgen_pipeline = _imgen_pipeline.to("cuda")
+        log.info("Pipeline loaded.")
+    return _imgen_pipeline
+
+@app.post("/api/imgen")
+async def process_imgen(req: Request) -> dict[str, Any]:
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+        
+    prompt = body.get("prompt", "").strip()
+    if not prompt:
+        raise HTTPException(status_code=400, detail="Missing 'prompt'")
+        
+    log.info("Generating image for prompt: %s", prompt)
+    
+    def _generate(p: str):
+        pipe = _get_imgen_pipeline()
+        # SDXL Base requires standard steps and resolution
+        neg_prompt = "ugly, deformed, extra limbs, extra fingers, bad anatomy, blurry, worst quality, low resolution, jpeg artifacts"
+        image = pipe(
+            prompt=p, 
+            negative_prompt=neg_prompt,
+            num_inference_steps=25, 
+            guidance_scale=7.5,
+            width=1024,
+            height=1024
+        ).images[0]
+        out = io.BytesIO()
+        image.save(out, format="JPEG", quality=92)
+        return out.getvalue()
+        
+    try:
+        result_bytes = await asyncio.wait_for(
+            asyncio.to_thread(_generate, prompt),
+            timeout=300.0,
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Image generation timed out")
+    except Exception as e:
+        log.exception("Image generation failed")
+        raise HTTPException(status_code=500, detail=str(e))
+        
+    b64_out = base64.b64encode(result_bytes).decode("ascii")
+    
+    return {
+        "image": b64_out,
+        "mime": "image/jpeg"
+    }
+
+
+# ---------------------------------------------------------------------------
 # State Synchronization & Auth
 # ---------------------------------------------------------------------------
 
@@ -711,6 +786,440 @@ async def save_state(req: Request) -> dict[str, bool]:
     except Exception as e:
         log.error("Failed to write state.json: %s", e)
         raise HTTPException(status_code=500, detail="Failed to save state")
+
+
+# ---------------------------------------------------------------------------
+# Code Review (/api/codereview)
+#
+# Stream a code review from Ollama for a path that can be:
+#   - a GitHub URL (file/blob, repo root, or tree/branch[/subdir])
+#   - any other http(s) URL (single-file fetch, e.g. a gist raw URL)
+#   - an SSH path "user@host:/path" (key-based auth only; uses `ssh` CLI)
+#   - a local path on this host (the machine running the proxy, i.e. the DGX)
+#
+# Requires the admin token (same one /api/state uses), because this endpoint
+# can read arbitrary filesystem paths and exec ssh. If you want it open,
+# delete the `_check_auth(req)` line below — but only on a trusted LAN.
+# ---------------------------------------------------------------------------
+
+CODEREVIEW_MAX_FILES = int(os.getenv("CODEREVIEW_MAX_FILES", "30"))
+CODEREVIEW_MAX_CHARS = int(os.getenv("CODEREVIEW_MAX_CHARS", "120000"))
+CODEREVIEW_DEFAULT_MODEL = os.getenv("CODEREVIEW_DEFAULT_MODEL", "deepseek-coder-v2")
+
+CODEREVIEW_FILE_EXTS = {
+    ".py", ".pyx", ".pyi",
+    ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs",
+    ".java", ".kt", ".kts", ".scala", ".groovy",
+    ".go", ".rs",
+    ".c", ".h", ".cc", ".cpp", ".cxx", ".hh", ".hpp",
+    ".cs",
+    ".rb", ".php",
+    ".swift", ".m", ".mm",
+    ".sh", ".bash", ".zsh", ".fish",
+    ".lua", ".pl", ".r", ".jl", ".ex", ".exs", ".erl",
+    ".sql",
+    ".html", ".htm", ".css", ".scss", ".sass", ".less",
+    ".vue", ".svelte",
+    ".yaml", ".yml", ".toml", ".ini", ".cfg", ".conf",
+    ".json", ".xml",
+    ".md", ".rst", ".txt",
+    ".tf", ".hcl", ".proto",
+    ".gradle",
+}
+CODEREVIEW_NAMED_FILES = {
+    "Makefile", "Dockerfile", "Rakefile", "Gemfile", "Procfile", "BUILD", "WORKSPACE",
+}
+CODEREVIEW_SKIP_DIRS = {
+    ".git", "node_modules", ".venv", "venv", "env", "__pycache__",
+    ".pytest_cache", ".mypy_cache", ".tox", "dist", "build", "target",
+    ".idea", ".vscode", ".next", ".nuxt", ".output", "out",
+    "coverage", "htmlcov", "vendor", "bower_components",
+}
+
+# user@host:/some/path or user@host:relative/path. user/host kept conservative.
+_SSH_PATH_RE = re.compile(r"^([A-Za-z0-9_][A-Za-z0-9_.-]*)@([A-Za-z0-9.-]+):(.+)$")
+
+# git@github.com:owner/repo[.git] — SSH-style git remote, not a real ssh fs path.
+_GIT_SSH_GITHUB_RE = re.compile(r"^git@github\.com:([^/\s]+)/([^/\s]+?)(?:\.git)?$")
+
+
+def _is_review_eligible(name_or_path: str) -> bool:
+    name = Path(name_or_path).name
+    if name in CODEREVIEW_NAMED_FILES:
+        return True
+    return Path(name_or_path).suffix.lower() in CODEREVIEW_FILE_EXTS
+
+
+def _truncate_bundle(files: list[dict], max_chars: int) -> tuple[list[dict], bool]:
+    total = 0
+    out: list[dict] = []
+    truncated = False
+    for f in files:
+        body = f.get("content") or ""
+        if total + len(body) > max_chars:
+            remaining = max_chars - total
+            if remaining > 800:
+                out.append({**f, "content": body[:remaining] + "\n\n... [truncated to fit budget]\n"})
+            truncated = True
+            break
+        out.append(f)
+        total += len(body)
+    return out, truncated
+
+
+async def _fetch_github(url: str) -> list[dict]:
+    """Resolve a GitHub URL to a list of {path, content} entries."""
+    u = urlparse(url)
+    parts = [p for p in u.path.split("/") if p]
+    if len(parts) < 2:
+        raise HTTPException(status_code=400, detail="GitHub URL needs at least owner/repo")
+    owner, repo = parts[0], parts[1]
+    if repo.endswith(".git"):
+        repo = repo[:-4]
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "shivagpt-codereview",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    token = os.getenv("GITHUB_TOKEN", "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+
+    async with httpx.AsyncClient(timeout=20.0, headers=headers, follow_redirects=True) as cli:
+        # Case 1: blob URL → single file
+        if len(parts) >= 5 and parts[2] == "blob":
+            branch = parts[3]
+            file_path = "/".join(parts[4:])
+            raw = await cli.get(
+                f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{file_path}"
+            )
+            if raw.status_code != 200:
+                raise HTTPException(status_code=raw.status_code,
+                                    detail=f"Could not fetch raw file: {raw.text[:200]}")
+            return [{"path": f"{owner}/{repo}/{file_path}", "content": raw.text}]
+
+        # Case 2: tree URL or repo root
+        if len(parts) >= 4 and parts[2] == "tree":
+            branch = parts[3]
+            subdir = "/".join(parts[4:]).rstrip("/")
+        else:
+            # Look up default branch
+            r = await cli.get(f"https://api.github.com/repos/{owner}/{repo}")
+            if r.status_code == 404:
+                raise HTTPException(status_code=404, detail=f"GitHub repo {owner}/{repo} not found")
+            r.raise_for_status()
+            branch = r.json().get("default_branch", "main")
+            subdir = ""
+
+        r = await cli.get(
+            f"https://api.github.com/repos/{owner}/{repo}/git/trees/{branch}",
+            params={"recursive": "1"},
+        )
+        if r.status_code == 404:
+            raise HTTPException(status_code=404,
+                                detail=f"Branch '{branch}' not found in {owner}/{repo}")
+        r.raise_for_status()
+        payload = r.json()
+        if payload.get("truncated"):
+            log.warning("codereview: GitHub tree response was truncated for %s/%s@%s",
+                        owner, repo, branch)
+        tree = payload.get("tree", [])
+
+        candidates: list[str] = []
+        for entry in tree:
+            if entry.get("type") != "blob":
+                continue
+            p = entry.get("path", "")
+            if subdir and not (p == subdir or p.startswith(subdir + "/")):
+                continue
+            if any(seg in CODEREVIEW_SKIP_DIRS for seg in p.split("/")):
+                continue
+            if not _is_review_eligible(p):
+                continue
+            candidates.append(p)
+
+        if not candidates:
+            raise HTTPException(status_code=400,
+                                detail="No reviewable source files found at that GitHub URL")
+        candidates = candidates[:CODEREVIEW_MAX_FILES]
+
+        async def fetch_one(p: str) -> dict | None:
+            raw_url = f"https://raw.githubusercontent.com/{owner}/{repo}/{branch}/{p}"
+            rr = await cli.get(raw_url)
+            if rr.status_code != 200:
+                return None
+            return {"path": f"{owner}/{repo}/{p}", "content": rr.text}
+
+        results = await asyncio.gather(*[fetch_one(p) for p in candidates])
+        return [r for r in results if r]
+
+
+async def _fetch_url(url: str) -> list[dict]:
+    """Fetch any other URL as one text blob."""
+    async with httpx.AsyncClient(timeout=20.0, follow_redirects=True,
+                                 headers={"User-Agent": "shivagpt-codereview"}) as cli:
+        r = await cli.get(url)
+        if r.status_code != 200:
+            raise HTTPException(status_code=r.status_code,
+                                detail=f"Could not fetch {url}: {r.text[:200]}")
+        name = Path(urlparse(url).path).name or "remote"
+        return [{"path": name, "content": r.text}]
+
+
+def _walk_local(root: Path) -> list[dict]:
+    if not root.exists():
+        raise HTTPException(status_code=404, detail=f"Local path not found: {root}")
+    if root.is_file():
+        try:
+            return [{"path": str(root), "content": root.read_text(encoding="utf-8", errors="replace")}]
+        except OSError as e:
+            raise HTTPException(status_code=400, detail=f"Cannot read {root}: {e}")
+    if not root.is_dir():
+        raise HTTPException(status_code=400, detail=f"Not a file or directory: {root}")
+    out: list[dict] = []
+    for cur, dirs, names in os.walk(root):
+        # Prune in-place so os.walk skips entire subtrees
+        dirs[:] = [d for d in dirs if d not in CODEREVIEW_SKIP_DIRS and not d.startswith(".")]
+        for n in names:
+            p = Path(cur) / n
+            if not _is_review_eligible(str(p)):
+                continue
+            try:
+                content = p.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            try:
+                rel = p.relative_to(root.parent)
+            except ValueError:
+                rel = p
+            out.append({"path": str(rel), "content": content})
+            if len(out) >= CODEREVIEW_MAX_FILES:
+                return out
+    return out
+
+
+def _fetch_ssh(user: str, host: str, remote_path: str) -> list[dict]:
+    """Pull files from a remote host via the local `ssh` binary.
+
+    Uses BatchMode=yes — keys only, no password prompts. Enumerates first
+    with `find`, then concatenates a small number of files in one ssh round
+    trip using a unique marker so we can split the output back into files.
+    """
+    target = f"{user}@{host}"
+
+    # 1. Enumerate eligible files on the remote. Find with prune for noise dirs
+    #    and an OR list of -iname patterns for the extensions we care about.
+    name_clause = " -o ".join(f"-iname '*{ext}'" for ext in sorted(CODEREVIEW_FILE_EXTS))
+    name_clause += "".join(f" -o -name '{n}'" for n in sorted(CODEREVIEW_NAMED_FILES))
+    prune_clause = " -o ".join(f"-name '{d}'" for d in sorted(CODEREVIEW_SKIP_DIRS))
+
+    quoted_path = shlex.quote(remote_path)
+    enum_script = (
+        f"if [ -f {quoted_path} ]; then echo F:{quoted_path}; exit 0; fi; "
+        f"if [ ! -d {quoted_path} ]; then echo MISSING; exit 0; fi; "
+        f"find {quoted_path} \\( -type d \\( {prune_clause} \\) -prune \\) -o "
+        f"-type f \\( {name_clause} \\) -print | head -n {CODEREVIEW_MAX_FILES}"
+    )
+
+    try:
+        listing = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+             "-o", "StrictHostKeyChecking=accept-new", target, enum_script],
+            capture_output=True, text=True, timeout=25,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504,
+                            detail=f"SSH to {target} timed out during enumeration")
+    if listing.returncode != 0:
+        raise HTTPException(
+            status_code=502,
+            detail=f"SSH to {target} failed: {listing.stderr.strip()[:300] or 'unknown error'}",
+        )
+    stdout = listing.stdout.strip()
+    if not stdout or stdout == "MISSING":
+        raise HTTPException(status_code=404,
+                            detail=f"Remote path not found: {target}:{remote_path}")
+
+    lines = [ln.strip() for ln in stdout.splitlines() if ln.strip()]
+    if lines and lines[0].startswith("F:"):
+        paths = [lines[0][2:]]
+    else:
+        paths = lines[:CODEREVIEW_MAX_FILES]
+
+    if not paths:
+        raise HTTPException(status_code=400,
+                            detail="No reviewable source files found on the remote path")
+
+    # 2. Cat all chosen files in one ssh call using a unique delimiter.
+    marker = f"---FILE-{secrets.token_hex(6)}---"
+    cat_script_parts = []
+    for p in paths:
+        qp = shlex.quote(p)
+        cat_script_parts.append(f"printf '%s\\n%s\\n' {shlex.quote(marker)} {qp}; cat {qp}")
+    cat_script = "; ".join(cat_script_parts)
+
+    try:
+        result = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=8",
+             "-o", "StrictHostKeyChecking=accept-new", target, cat_script],
+            capture_output=True, text=True, timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        raise HTTPException(status_code=504,
+                            detail=f"SSH to {target} timed out while reading files")
+    if result.returncode != 0:
+        raise HTTPException(
+            status_code=502,
+            detail=f"SSH cat failed on {target}: {result.stderr.strip()[:300]}",
+        )
+
+    out: list[dict] = []
+    chunks = result.stdout.split(marker + "\n")
+    for chunk in chunks:
+        if not chunk:
+            continue
+        nl = chunk.find("\n")
+        if nl < 0:
+            continue
+        path_line = chunk[:nl]
+        body = chunk[nl + 1:]
+        out.append({"path": f"{target}:{path_line}", "content": body})
+    if not out:
+        raise HTTPException(status_code=502,
+                            detail="Could not parse any files from the SSH response")
+    return out
+
+
+def _build_codereview_prompt(files: list[dict], instructions: str) -> tuple[str, str]:
+    files, truncated = _truncate_bundle(files, CODEREVIEW_MAX_CHARS)
+    body_parts = []
+    for f in files:
+        body_parts.append(f"\n### `{f['path']}`\n```\n{f['content']}\n```\n")
+    system = (
+        "You are a senior software engineer doing a focused code review. "
+        "Be concrete: point to specific functions, line patterns, or variables; "
+        "skip nitpicks unless they materially affect correctness or maintainability. "
+        "Group findings by file. When you suggest a change, show a short fenced code "
+        "block with the proposed rewrite. End with: (1) a short overall summary and "
+        "(2) the top three changes you would make."
+    )
+    instr_block = f"{instructions.strip()}\n\n" if instructions.strip() else ""
+    user = (
+        f"{instr_block}Please review the following {len(files)} file(s)."
+        + ("\n\n[NOTE: the file bundle was truncated to stay within budget.]" if truncated else "")
+        + "".join(body_parts)
+    )
+    return system, user
+
+
+@app.post("/api/codereview")
+async def code_review(req: Request) -> StreamingResponse:
+    """Gather code from `path` (GitHub URL / other URL / SSH / local) and
+    stream a review from Ollama as NDJSON, same shape as /api/chat."""
+    _check_auth(req)
+
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    path = (body.get("path") or "").strip()
+    if not path:
+        raise HTTPException(status_code=400, detail="Missing 'path'")
+    model = (body.get("model") or "").strip() or CODEREVIEW_DEFAULT_MODEL
+    instructions = (body.get("instructions") or "").strip()
+    try:
+        temperature = float(body.get("temperature", 0.2))
+    except (TypeError, ValueError):
+        temperature = 0.2
+
+    # Resolve path → list of files. Order matters: the git-SSH-remote pattern
+    # for GitHub overlaps the generic user@host:path pattern, so check it first.
+    try:
+        gh_ssh = _GIT_SSH_GITHUB_RE.match(path)
+        if gh_ssh:
+            owner, repo = gh_ssh.group(1), gh_ssh.group(2)
+            files = await _fetch_github(f"https://github.com/{owner}/{repo}")
+        elif path.startswith(("https://github.com/", "http://github.com/")):
+            files = await _fetch_github(path)
+        elif path.startswith(("http://", "https://")):
+            files = await _fetch_url(path)
+        elif _SSH_PATH_RE.match(path):
+            m = _SSH_PATH_RE.match(path)
+            assert m is not None
+            files = await asyncio.to_thread(_fetch_ssh, m.group(1), m.group(2), m.group(3))
+        else:
+            files = await asyncio.to_thread(_walk_local, Path(path).expanduser())
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
+    except Exception as e:
+        log.exception("codereview: gather failed for %s", path)
+        raise HTTPException(status_code=500,
+                            detail=f"Failed to gather files: {e.__class__.__name__}: {e}")
+
+    if not files:
+        raise HTTPException(status_code=400, detail="No reviewable files found at that path")
+
+    system_prompt, user_prompt = _build_codereview_prompt(files, instructions)
+    total_chars = sum(len(f["content"]) for f in files)
+    log.info("codereview: path=%r files=%d chars=%d model=%s",
+             path, len(files), total_chars, model)
+
+    upstream = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+        "stream": True,
+        "options": {"temperature": temperature},
+    }).encode("utf-8")
+
+    file_list_preview = "\n".join(f"  - `{f['path']}`" for f in files[:20])
+    if len(files) > 20:
+        file_list_preview += f"\n  - … and {len(files) - 20} more"
+    preamble = (
+        f"_Gathered **{len(files)}** file(s) ({total_chars:,} chars) from `{path}`._\n"
+        f"_Model: `{model}`._\n\n"
+        f"<details><summary>Files reviewed</summary>\n\n{file_list_preview}\n\n</details>\n\n"
+    )
+
+    async def streamer():
+        # Emit a small preamble in the same NDJSON shape Ollama uses.
+        yield (json.dumps({"message": {"role": "assistant", "content": preamble}}) + "\n").encode()
+        timeout = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+        try:
+            async with httpx.AsyncClient(timeout=timeout) as c:
+                async with c.stream(
+                    "POST",
+                    f"{OLLAMA_URL}/api/chat",
+                    content=upstream,
+                    headers={"content-type": "application/json"},
+                ) as r:
+                    if r.status_code != 200:
+                        text = await r.aread()
+                        msg = text.decode("utf-8", errors="replace")
+                        yield (json.dumps({"error": msg, "status": r.status_code}) + "\n").encode()
+                        return
+                    async for chunk in r.aiter_raw():
+                        if chunk:
+                            yield chunk
+        except httpx.ConnectError:
+            yield (json.dumps({"error": f"Cannot connect to Ollama at {OLLAMA_URL}."}) + "\n").encode()
+        except httpx.ReadTimeout:
+            yield (json.dumps({"error": "Ollama timed out while generating."}) + "\n").encode()
+        except Exception as e:
+            log.exception("codereview stream failed")
+            yield (json.dumps({"error": f"Server error: {e.__class__.__name__}: {e}"}) + "\n").encode()
+
+    return StreamingResponse(
+        streamer(),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/api/cancel/{model}")

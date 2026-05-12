@@ -102,6 +102,31 @@ hits 100%, "extracting…" means the DGX is reading the file. If anything
 goes wrong, the chip turns red with a clear reason — and you get a Retry
 button (↻) without having to pick the file again.
 
+## Can I ask it to review some code?
+
+Yes — type a `/` in the chat box and pick `/codereview`. After the
+command, paste any of these:
+
+- A GitHub link to a file, folder, or whole repo:
+  `/codereview https://github.com/ndramesh/shivagpt`
+- The "git SSH" address you'd use to clone a repo:
+  `/codereview git@github.com:ndramesh/shivagpt.git`
+- A folder sitting on Kailash itself:
+  `/codereview /home/shiva/some-project`
+- A folder on another computer you can SSH to:
+  `/codereview shiva@my-laptop:/Users/shiva/src/foo`
+
+ShivaGPT gathers up the source files (it skips junk like `node_modules`
+and `.git`), shows you the list, then asks a coder model on Kailash to
+read everything and write a review — bugs it sees, things worth
+changing, plus a short summary at the end. The whole answer streams in
+front of you like a normal chat reply.
+
+Because this command reaches into folders and can phone other computers
+over SSH, you have to be logged in first with `/login` (one-time, sticks
+in your browser). If you forget, ShivaGPT will say "Admin login
+required".
+
 ## What about my chat history?
 
 It's saved in your browser's local storage — like a private notebook

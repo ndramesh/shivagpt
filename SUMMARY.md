@@ -89,6 +89,12 @@ shivagpt/
 |   POST | `/api/show`                | Passthrough Ollama `/api/show` (used to read each model's `*.context_length`) |
 |   POST | `/api/chat`                | Streams Ollama chat back as NDJSON |
 |   POST | `/api/files`               | Multipart upload — returns extracted text or base64 image |
+|   POST | `/api/image`               | Image manipulation (Upscayl/PIL) — JSON in/out |
+|   POST | `/api/imgen`               | Image generation (SDXL Base) — JSON in/out |
+|   POST | `/api/codereview`          | Gather code from URL / SSH / local path, stream a review as NDJSON. **Admin auth required.** |
+|    GET | `/api/state`               | Admin: read server-side state.json |
+|   POST | `/api/state`               | Admin: write server-side state.json |
+|   POST | `/api/login`               | Exchange `ADMIN_PASSWORD` for a bearer token |
 |    GET | `/manifest.webmanifest`    | PWA manifest |
 |    GET | `/icon.svg` `/icon-192.png` `/icon-512.png` | Icons (PNGs generated in-process) |
 
@@ -266,6 +272,60 @@ Plan when picked up:
 Sources:
 - https://github.com/Sanster/IOPaint
 - https://github.com/advimman/lama
+
+---
+
+## 10b. `/codereview` slash command (LATEST)
+
+**Status: code-complete, structurally verified, not yet deployed by me.**
+The user will run `./deploy.sh --service` from their Mac.
+
+Frontend: `/codereview` is in `SLASH_COMMANDS`, handled in
+`handleSlashCommandExecution` (parses optional `-model X`, then `<path>`,
+then trailing instructions), echoes the command as a user message, and
+calls `streamCodeReview()` — a near-copy of `streamChat()` that POSTs
+`/api/codereview` with `Authorization: Bearer <state.adminToken>`.
+
+Backend: `POST /api/codereview` in `server.py`, gated by `_check_auth`.
+Path dispatch order (matters — `_GIT_SSH_GITHUB_RE` must be checked
+before `_SSH_PATH_RE` because both match `git@github.com:owner/repo`):
+
+1. `git@github.com:owner/repo[.git]` → rewritten to GitHub HTTPS, routed
+   to `_fetch_github`.
+2. `https://github.com/...` → `_fetch_github` (Git Tree API + concurrent
+   raw fetches). Honors `GITHUB_TOKEN`.
+3. Other `http(s)://` → `_fetch_url` (one text blob).
+4. `user@host:/path` → `_fetch_ssh` via blocking `subprocess.run`
+   wrapped in `asyncio.to_thread`. Two SSH calls: an enumeration with
+   `find ... -prune ... -iname '*.ext' | head -n N`, then a batched
+   `cat` with a unique marker so we split the response back into files.
+   `BatchMode=yes`, `StrictHostKeyChecking=accept-new`, `ConnectTimeout=8`.
+5. Anything else → `_walk_local` on the host running the proxy (DGX).
+
+Env knobs (default in parens):
+- `CODEREVIEW_DEFAULT_MODEL` (`deepseek-coder-v2`) — used when no
+  `-model` flag.
+- `CODEREVIEW_MAX_FILES` (30) — cap on files bundled per review.
+- `CODEREVIEW_MAX_CHARS` (120 000) — total character budget.
+- `GITHUB_TOKEN` — optional; bumps GitHub rate limits / private repos.
+
+Auth gotcha to remember: the unit doesn't pass `ADMIN_PASSWORD` through,
+so on first install it falls back to the baked-in default (`ndr123`).
+Override with `sudo systemctl edit shivagpt` →
+`Environment=ADMIN_PASSWORD=<long>`. The endpoint can't be reached
+without the token, so the gate is real — strength of the gate depends
+on this one variable.
+
+SSH gotcha: `ProtectHome=read-only` in the systemd unit means `ssh`
+inside the service can *read* the run user's keys but can't *write*
+`known_hosts`. Pre-seed once:
+`ssh kailash 'ssh-keyscan -H other-box >> ~/.ssh/known_hosts'`. Local
+paths and GitHub URLs aren't affected.
+
+The streamed response shape is identical to `/api/chat` (NDJSON,
+`{message:{content:"..."}}` per chunk, terminating `{done:true}`), so
+the frontend reader in `streamCodeReview` is essentially a copy of
+`streamChat` with a different URL/body and the Bearer header.
 
 ---
 

@@ -4,6 +4,24 @@ All notable changes to ShivaGPT are documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **`/codereview` slash command** — review code from a GitHub URL, an
+  ssh-style git remote (`git@github.com:owner/repo[.git]`), any other
+  `http(s)://` URL, an SSH filesystem path (`user@host:/path`), or a
+  local path on the DGX. Optional `-model <name>` flag overrides the
+  default. Streams the review into the chat like a normal assistant reply
+  with a preamble listing every file that was bundled.
+- **`POST /api/codereview` endpoint** — auth-gated through the existing
+  admin token (`_check_auth`, same as `/api/state`) because it can read
+  arbitrary filesystem paths and shell out to `ssh`. Body:
+  `{model?, path, instructions?, temperature?}`. Streams NDJSON in the
+  same shape as `/api/chat` so the frontend reader is reused. Tunable via
+  env: `CODEREVIEW_DEFAULT_MODEL` (default `deepseek-coder-v2`),
+  `CODEREVIEW_MAX_FILES` (30), `CODEREVIEW_MAX_CHARS` (120 000). Honors
+  `GITHUB_TOKEN` for higher GitHub API rate limits / private repos. SSH
+  enumeration uses one round-trip `find` and a batched marker-delimited
+  `cat`; only key-based auth is allowed (`BatchMode=yes`).
+
 ### Fixed
 - **iPhone portrait blank screen** — The mobile CSS grid gave the sidebar a
   `0`-width column and made it `position: fixed` (out of flow), which caused

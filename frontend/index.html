@@ -832,6 +832,61 @@
       color: var(--text-3);
     }
 
+    /* ---------- Slash Menu ---------- */
+    .slash-menu {
+      display: none;
+      position: absolute;
+      bottom: calc(100% + 8px);
+      left: 0;
+      width: 100%;
+      max-width: 400px;
+      background: var(--bg-elev-2);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      z-index: 100;
+      overflow: hidden;
+      flex-direction: column;
+    }
+    .slash-menu.show {
+      display: flex;
+    }
+    .slash-menu-list {
+      max-height: 260px;
+      overflow-y: auto;
+      scrollbar-width: thin;
+      scrollbar-color: var(--border-strong) transparent;
+      padding: 4px;
+    }
+    .slash-item {
+      padding: 8px 12px;
+      border-radius: 6px;
+      cursor: pointer;
+      display: flex;
+      align-items: baseline;
+      gap: 10px;
+      transition: background var(--transition);
+    }
+    .slash-item:hover, .slash-item.selected {
+      background: var(--bg-hover);
+    }
+    .slash-item .cmd-name {
+      font-weight: 600;
+      color: var(--text-1);
+      font-size: 14px;
+    }
+    .slash-item .cmd-hint {
+      color: var(--accent);
+      font-size: 12px;
+      opacity: 0.8;
+    }
+    .slash-item .cmd-desc {
+      color: var(--text-3);
+      font-size: 12px;
+      margin-left: auto;
+      text-align: right;
+    }
+
     .send-btn {
       flex-shrink: 0;
       width: 34px;
@@ -1654,6 +1709,11 @@
           <button id="switchVisionBtn">Use qwen2.5vl</button>
         </div>
         <div id="attachPreview" class="attach-preview"></div>
+        <div style="position: relative; max-width: 760px; margin: 0 auto;">
+          <div id="slashMenu" class="slash-menu">
+            <div class="slash-menu-list" id="slashMenuList"></div>
+          </div>
+        </div>
         <div class="composer">
           <input type="file" id="fileInput" multiple hidden
             accept="image/*,.pdf,.csv,.txt,.md,.json,.yaml,.yml,.xml,.log" />
@@ -1887,6 +1947,28 @@
         numPredict: -1,
         defaultSystem: '',
       };
+
+      /* ---------- Slash Commands ---------- */
+      const SLASH_COMMANDS = [
+        { name: '/help', desc: 'Show all available commands', hasArgs: false },
+        { name: '/clear', desc: 'Clear conversation and start new', hasArgs: false },
+        { name: '/reset', desc: 'Clear conversation and start new', hasArgs: false },
+        { name: '/compact', desc: 'Summarize conversation to save context', hasArgs: true, hint: '[focus]' },
+        { name: '/model', desc: 'Switch model', hasArgs: true, hint: '[name]' },
+        { name: '/temperature', desc: 'Set temperature (0-1.5)', hasArgs: true, hint: '<val>' },
+        { name: '/system', desc: 'Set system prompt', hasArgs: true, hint: '[prompt]' },
+        { name: '/rename', desc: 'Rename current conversation', hasArgs: true, hint: '<title>' },
+        { name: '/delete', desc: 'Delete current conversation', hasArgs: false },
+        { name: '/export', desc: 'Open export dialog', hasArgs: false },
+        { name: '/settings', desc: 'Open settings drawer', hasArgs: false },
+        { name: '/vision', desc: 'Switch to a vision model', hasArgs: false },
+        { name: '/cost', desc: 'Show estimated token usage', hasArgs: false },
+        { name: '/login', desc: 'Open admin login', hasArgs: false },
+        { name: '/logout', desc: 'Log out admin session', hasArgs: false },
+        { name: '/debug', desc: 'Show system debug info', hasArgs: false },
+        { name: '/imgen', desc: 'Generate an image', hasArgs: true, hint: '<description>' },
+        { name: '/codereview', desc: 'Review code from a URL, ssh path, or local folder', hasArgs: true, hint: '[-model X] <path>' },
+      ];
 
       const BUILT_IN_PRESETS = [
         {
@@ -2378,7 +2460,7 @@
         const av = el('div', { class: 'avatar' }, isUser ? 'You' : (isSys ? 'Sys' : 'AI'));
         const body = el('div', { class: 'msg-body' });
         const meta = el('div', { class: 'msg-meta' },
-          el('span', { class: 'who' }, isUser ? 'You' : (isSys ? 'System' : 'Assistant')),
+          el('span', { class: 'who' }, isUser ? 'You' : (isSys ? 'System' : 'ShivaGPT')),
           m.model ? el('span', { class: 'model' }, '· ' + m.model) : null,
           renderTokChip(m),
           m.ts ? el('span', { class: 'ts' }, fmtTime(m.ts)) : null,
@@ -2386,7 +2468,7 @@
         const content = el('div', { class: 'msg-content' });
         content.dataset.role = m.role;
         content.dataset.raw = '';   // we update via assignContent
-        assignContent(content, m.content || '', !isUser && !isSys);
+        assignContent(content, m.content || '', !isUser);
 
         // Show attachment indicators for user messages with files
         if (m.attachments && m.attachments.length) {
@@ -2399,6 +2481,22 @@
             attWrap.appendChild(ind);
           }
           content.insertBefore(attWrap, content.firstChild);
+        }
+
+        // Show generated images directly via DOM to bypass markdown length limits
+        if (m.generatedImage) {
+          const imgWrap = el('div', { style: { marginTop: '8px' } });
+          const img = el('img', {
+            src: `data:${m.generatedImage.mime};base64,${m.generatedImage.base64}`,
+            alt: 'Generated Image',
+            style: { maxWidth: '100%', borderRadius: '8px', cursor: 'pointer' },
+            onclick: () => {
+              // Option to open in viewer if we want
+              window.open(`data:${m.generatedImage.mime};base64,${m.generatedImage.base64}`, '_blank');
+            }
+          });
+          imgWrap.appendChild(img);
+          content.appendChild(imgWrap);
         }
 
         const actions = el('div', { class: 'msg-actions' });
@@ -2748,6 +2846,16 @@
         const text = $('composer').value.trim();
         // Allow send if there's text OR attachments
         if (!text && !pendingFiles.length) return;
+
+        // Handle slash commands (executed on enter)
+        if (text.startsWith('/')) {
+          if (await handleSlashCommandExecution(text)) {
+            $('composer').value = '';
+            autoSize($('composer'));
+            return;
+          }
+        }
+
         // Wait for any uploads still in progress
         if (pendingFiles.some(f => f.uploading)) { toast('Files still uploading...'); return; }
 
@@ -2999,6 +3107,448 @@
         ta.style.height = Math.min(200, ta.scrollHeight) + 'px';
       }
 
+      /* ---------- Slash Command Logic ---------- */
+      let slashSelectedIndex = 0;
+      let slashMatches = [];
+
+      function updateSlashMenu() {
+        const val = $('composer').value;
+        const menu = $('slashMenu');
+        const list = $('slashMenuList');
+        
+        if (!val.startsWith('/')) {
+          menu.classList.remove('show');
+          return;
+        }
+
+        const query = val.split(' ')[0].toLowerCase();
+        // If there's a space, they're typing args, hide menu
+        if (val.includes(' ')) {
+          menu.classList.remove('show');
+          return;
+        }
+
+        slashMatches = SLASH_COMMANDS.filter(c => c.name.startsWith(query));
+        
+        if (!slashMatches.length) {
+          menu.classList.remove('show');
+          return;
+        }
+
+        list.innerHTML = '';
+        slashMatches.forEach((cmd, idx) => {
+          const item = el('div', {
+            class: 'slash-item' + (idx === slashSelectedIndex ? ' selected' : ''),
+            onclick: () => selectSlashCommand(cmd)
+          },
+            el('span', { class: 'cmd-name' }, cmd.name),
+            cmd.hint ? el('span', { class: 'cmd-hint' }, cmd.hint) : null,
+            el('span', { class: 'cmd-desc' }, cmd.desc)
+          );
+          list.appendChild(item);
+        });
+
+        menu.classList.add('show');
+        
+        // Scroll into view
+        const selected = list.children[slashSelectedIndex];
+        if (selected) {
+          selected.scrollIntoView({ block: 'nearest' });
+        }
+      }
+
+      function selectSlashCommand(cmd) {
+        const ta = $('composer');
+        if (cmd.hasArgs) {
+          ta.value = cmd.name + ' ';
+          ta.focus();
+          updateSlashMenu();
+        } else {
+          ta.value = cmd.name;
+          send();
+          $('slashMenu').classList.remove('show');
+        }
+      }
+
+      async function handleSlashCommandExecution(text) {
+        const parts = text.split(' ');
+        const cmdName = parts[0].toLowerCase();
+        const args = parts.slice(1).join(' ');
+        
+        const cmd = SLASH_COMMANDS.find(c => c.name === cmdName);
+        if (!cmd) return false; // not a known command
+        
+        let c = getActive();
+        
+        switch (cmdName) {
+          case '/help':
+            if (!c) c = newConvo();
+            const helpText = SLASH_COMMANDS.map(x => `**${x.name}** ${x.hint ? `\`${x.hint}\`` : ''} - ${x.desc}`).join('\n');
+            c.messages.push({
+              role: 'system',
+              content: `**Available Slash Commands:**\n\n${helpText}`,
+              ts: Date.now()
+            });
+            persistAll();
+            renderActive();
+            break;
+            
+          case '/clear':
+          case '/reset':
+            newConvo();
+            toast('Started new conversation');
+            break;
+            
+          case '/compact':
+            if (!c || c.messages.length === 0) {
+              toast('Nothing to compact');
+              break;
+            }
+            if (!confirm('This will summarize the conversation and permanently replace the history to save context tokens. Continue?')) {
+              break;
+            }
+            toast('Compacting conversation...');
+            const sysPrompt = args ? `Summarize this conversation briefly, focusing heavily on: ${args}` : 'Summarize the key points, decisions, and established context of this conversation in a concise format. Omit pleasantries.';
+            
+            // Generate summary without adding to chat UI yet
+            try {
+              $('sendBtn').disabled = true;
+              const r = await fetch(apiUrl('/api/chat'), {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                  model: resolveModel(c.model),
+                  messages: [
+                    ...buildOllamaMessages(c),
+                    { role: 'user', content: sysPrompt }
+                  ],
+                  stream: false,
+                  options: { temperature: 0.3 }
+                })
+              });
+              if (!r.ok) throw new Error('Failed to summarize');
+              const data = await r.json();
+              const summary = data.message?.content;
+              if (summary) {
+                // Replace history
+                c.messages = [{ role: 'system', content: `**Conversation compacted:**\n\n${summary}`, ts: Date.now() }];
+                c.updatedAt = Date.now();
+                persistAll();
+                renderActive();
+                toast('Conversation compacted');
+              }
+            } catch (e) {
+              console.error(e);
+              toast('Failed to compact conversation');
+            } finally {
+              $('sendBtn').disabled = false;
+            }
+            break;
+            
+          case '/model':
+            if (args) {
+              if (!c) c = newConvo();
+              c.model = args;
+              persistAll();
+              renderAllModelDropdowns();
+              updateVisionHint();
+              toast(`Model set to ${args}`);
+            } else {
+              if (!c) c = newConvo();
+              const modelList = state.models.map(m => `- ${m.name}`).join('\n');
+              c.messages.push({
+                role: 'system',
+                content: `**Available Models:**\n${modelList || 'None found'}`,
+                ts: Date.now()
+              });
+              persistAll();
+              renderActive();
+            }
+            break;
+            
+          case '/temperature':
+            if (args && !isNaN(parseFloat(args))) {
+              if (!c) c = newConvo();
+              c.temperature = clamp(parseFloat(args), 0, 1.5);
+              persistAll();
+              toast(`Temperature set to ${c.temperature}`);
+            } else {
+              toast(`Current temperature: ${c ? c.temperature : state.settings.defaultTemperature}`);
+            }
+            break;
+            
+          case '/system':
+            if (!c) c = newConvo();
+            c.systemPrompt = args;
+            persistAll();
+            toast(args ? 'System prompt updated' : 'System prompt cleared');
+            break;
+            
+          case '/rename':
+            if (!c) { toast('No conversation to rename'); break; }
+            if (args) {
+              renameConvo(c.id, args);
+            } else {
+              const next = prompt('Rename conversation', c.title);
+              if (next != null) renameConvo(c.id, next.trim());
+            }
+            break;
+            
+          case '/delete':
+            if (c) {
+              if (confirm('Delete this conversation?')) deleteConvo(c.id);
+            }
+            break;
+            
+          case '/export':
+            openExport();
+            break;
+            
+          case '/settings':
+            openSettings();
+            break;
+            
+          case '/vision':
+            switchToVisionModel();
+            break;
+            
+          case '/cost':
+            if (!c) break;
+            const tin = c.messages.reduce((sum, m) => sum + (m.tokensIn || 0), 0);
+            const tout = c.messages.reduce((sum, m) => sum + (m.tokensOut || 0), 0);
+            c.messages.push({
+              role: 'system',
+              content: `**Token Usage (Session Estimated):**\n- Prompt: ${fmtNum(tin)}\n- Completion: ${fmtNum(tout)}\n- Total: ${fmtNum(tin + tout)}`,
+              ts: Date.now()
+            });
+            persistAll();
+            renderActive();
+            break;
+            
+          case '/login':
+            showModal('loginModal');
+            break;
+            
+          case '/logout':
+            handleLogout();
+            break;
+            
+          case '/debug':
+            if (!c) c = newConvo();
+            try {
+              const r = await fetch(apiUrl('/api/debug'));
+              if (r.ok) {
+                const data = await r.json();
+                c.messages.push({
+                  role: 'system',
+                  content: `**Debug Info:**\n\`\`\`json\n${JSON.stringify(data, null, 2)}\n\`\`\``,
+                  ts: Date.now()
+                });
+                persistAll();
+                renderActive();
+              }
+            } catch(e) {
+              toast('Failed to get debug info');
+            }
+            break;
+            
+          case '/imgen':
+            if (!args) { toast('Please provide a description'); break; }
+            if (!c) c = newConvo();
+            
+            // Add a temporary loading message
+            const loadingMsg = { role: 'system', content: `*Generating image for: "${args}"...*`, ts: Date.now() };
+            c.messages.push(loadingMsg);
+            persistAll();
+            renderActive();
+            scrollToBottom();
+            
+            $('sendBtn').disabled = true;
+            try {
+              const r = await fetch(apiUrl('/api/imgen'), {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({ prompt: args })
+              });
+              if (!r.ok) {
+                const err = await r.text();
+                throw new Error(err);
+              }
+              const data = await r.json();
+              
+              // Replace loading message with the actual image
+              const i = c.messages.indexOf(loadingMsg);
+              if (i >= 0) {
+                c.messages[i].content = `**Generated Image:** "${args}"`;
+                c.messages[i].generatedImage = { mime: data.mime, base64: data.image };
+                persistAll();
+                renderActive();
+                scrollToBottom();
+              }
+            } catch (e) {
+              console.error(e);
+              const i = c.messages.indexOf(loadingMsg);
+              if (i >= 0) {
+                c.messages[i].content = `*Failed to generate image: ${e.message}*`;
+                persistAll();
+                renderActive();
+              }
+              toast('Image generation failed');
+            } finally {
+              $('sendBtn').disabled = false;
+            }
+            break;
+
+          case '/codereview': {
+            if (!args) {
+              toast('Usage: /codereview [-model <model>] <path> [optional instructions]');
+              break;
+            }
+            // Parse: optional "-model X" / "-m X" prefix, then <path>, then optional instructions.
+            let crModel = '';
+            let rest = args.trim();
+            const mflag = rest.match(/^(?:-m|-model|--model)\s+(\S+)\s*(.*)$/);
+            if (mflag) { crModel = mflag[1]; rest = mflag[2].trim(); }
+            const firstSp = rest.indexOf(' ');
+            const crPath = firstSp < 0 ? rest : rest.slice(0, firstSp).trim();
+            const crInstr = firstSp < 0 ? '' : rest.slice(firstSp + 1).trim();
+            if (!crPath) { toast('Missing <path>'); break; }
+            if (!state.adminToken) {
+              toast('Admin login required — run /login first');
+              break;
+            }
+            if (!c) c = newConvo();
+
+            // Echo the command as a user message so the convo reads naturally.
+            const echo = `/codereview${crModel ? ` -model ${crModel}` : ''} ${crPath}${crInstr ? `  ${crInstr}` : ''}`;
+            c.messages.push({ role: 'user', content: echo, ts: Date.now() });
+            autoTitleFromFirstUserMsg(c);
+            c.updatedAt = Date.now();
+            persistAll();
+            renderSidebar();
+            renderActive();
+
+            // Append the assistant placeholder + cursor, same pattern as send().
+            const asst = { role: 'assistant', content: '', ts: Date.now(), model: crModel || resolveModel(c.model) };
+            c.messages.push(asst);
+            const wrap = $('messages').querySelector('.msg-wrap') || (() => {
+              const n = el('div', { class: 'msg-wrap' });
+              $('messages').innerHTML = ''; $('messages').appendChild(n);
+              return n;
+            })();
+            const node = renderMsg(asst);
+            wrap.appendChild(node);
+            const contentEl = node.querySelector('.msg-content');
+            const cursor = el('span', { class: 'typing-cursor' });
+            contentEl.appendChild(cursor);
+            scrollToBottom();
+
+            // If the user didn't pass -model, let the server pick its
+            // CODEREVIEW_DEFAULT_MODEL (a coder model is usually right for
+            // reviews, regardless of which model the conversation is on).
+            await streamCodeReview(c, asst, contentEl, cursor,
+              { model: crModel, path: crPath, instructions: crInstr });
+            break;
+          }
+        }
+        return true;
+      }
+
+      async function streamCodeReview(convo, assistantMsg, contentEl, cursorEl, payload) {
+        state.streaming = true;
+        setSendButtonState(true);
+        state.abortController = new AbortController();
+
+        // Slightly different message — the server is fetching/parsing files
+        // before the model even starts generating.
+        const slowTimer = setTimeout(() => {
+          if (state.streaming && !assistantMsg.content) {
+            contentEl.appendChild(el('div', { class: 'info-banner', id: 'slow-banner-' + assistantMsg.ts },
+              'Still gathering files… (large repos / cold SSH connections can take 10–30s).'));
+          }
+        }, 4500);
+
+        let buf = '';
+        let firstToken = true;
+        try {
+          const r = await fetch(apiUrl('/api/codereview'), {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'Authorization': `Bearer ${state.adminToken || ''}`,
+            },
+            body: JSON.stringify({
+              model: payload.model || undefined,
+              path: payload.path,
+              instructions: payload.instructions || '',
+            }),
+            signal: state.abortController.signal,
+          });
+          if (!r.ok) {
+            let detail = '';
+            try { const j = await r.json(); detail = j.detail || JSON.stringify(j); }
+            catch { detail = await r.text(); }
+            throw new Error(`Server returned ${r.status}: ${(detail || '').slice(0, 500)}`);
+          }
+          if (!r.body) throw new Error('No response body — streaming unsupported in this browser?');
+          const reader = r.body.getReader();
+          const decoder = new TextDecoder();
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            let idx;
+            while ((idx = buf.indexOf('\n')) >= 0) {
+              const line = buf.slice(0, idx).trim();
+              buf = buf.slice(idx + 1);
+              if (!line) continue;
+              let obj;
+              try { obj = JSON.parse(line); } catch (e) { continue; }
+              if (obj.error) throw new Error(obj.error);
+              if (firstToken) {
+                firstToken = false;
+                const sb = $('slow-banner-' + assistantMsg.ts);
+                if (sb) sb.remove();
+              }
+              const piece = (obj.message && obj.message.content) || '';
+              if (piece) {
+                assistantMsg.content += piece;
+                if (cursorEl.parentNode === contentEl) contentEl.removeChild(cursorEl);
+                assignContent(contentEl, assistantMsg.content, true);
+                contentEl.appendChild(cursorEl);
+                scrollToBottom();
+              }
+              if (obj.done) {
+                if (typeof obj.prompt_eval_count === 'number') assistantMsg.tokensIn = obj.prompt_eval_count;
+                if (typeof obj.eval_count === 'number') assistantMsg.tokensOut = obj.eval_count;
+                if (typeof obj.eval_duration === 'number') assistantMsg.evalSeconds = obj.eval_duration / 1e9;
+                if (typeof obj.total_duration === 'number') assistantMsg.totalSeconds = obj.total_duration / 1e9;
+                const n2 = contentEl.closest('.msg');
+                if (n2) updateTokChipInPlace(n2, assistantMsg);
+                updateCtxMeter();
+                break;
+              }
+            }
+          }
+        } catch (e) {
+          if (e.name === 'AbortError') {
+            appendError(contentEl, 'Stopped by you.');
+          } else {
+            console.error(e);
+            appendError(contentEl, friendlyError(e));
+          }
+        } finally {
+          clearTimeout(slowTimer);
+          if (cursorEl.parentNode === contentEl) contentEl.removeChild(cursorEl);
+          state.streaming = false;
+          state.abortController = null;
+          setSendButtonState(false);
+          convo.updatedAt = Date.now();
+          persistAll();
+          renderSidebar();
+        }
+      }
+
       /* ---------- Settings ---------- */
       function openSettings() {
         $('setApiBase').value = state.settings.apiBase || '';
@@ -3130,7 +3680,7 @@
         }
         lines.push('');
         for (const m of c.messages) {
-          const tag = m.role === 'user' ? 'You' : (m.role === 'assistant' ? 'Assistant' : 'System');
+          const tag = m.role === 'user' ? 'You' : (m.role === 'assistant' ? 'ShivaGPT' : 'System');
           const stats = (m.role === 'assistant' && m.tokensOut != null)
             ? ` _(${fmtNum(m.tokensIn || 0)} in · ${fmtNum(m.tokensOut)} out)_`
             : '';
@@ -3144,7 +3694,7 @@
       function convoToText(c) {
         const lines = [`${c.title}`, '='.repeat(c.title.length), ''];
         for (const m of c.messages) {
-          const tag = m.role === 'user' ? 'You' : (m.role === 'assistant' ? 'Assistant' : 'System');
+          const tag = m.role === 'user' ? 'You' : (m.role === 'assistant' ? 'ShivaGPT' : 'System');
           lines.push(`[${tag}]`);
           lines.push(m.content || '');
           lines.push('');
@@ -3245,7 +3795,11 @@
 
         // Composer
         const ta = $('composer');
-        ta.addEventListener('input', () => autoSize(ta));
+        ta.addEventListener('input', () => {
+          autoSize(ta);
+          slashSelectedIndex = 0;
+          updateSlashMenu();
+        });
 
         // Track IME composition state manually — iOS Safari's e.isComposing
         // is unreliable and can block Enter from sending.
@@ -3254,6 +3808,31 @@
         ta.addEventListener('compositionend', () => { composing = false; });
 
         ta.addEventListener('keydown', (e) => {
+          const menu = $('slashMenu');
+          if (menu.classList.contains('show')) {
+            if (e.key === 'ArrowDown') {
+              e.preventDefault();
+              slashSelectedIndex = (slashSelectedIndex + 1) % slashMatches.length;
+              updateSlashMenu();
+              return;
+            } else if (e.key === 'ArrowUp') {
+              e.preventDefault();
+              slashSelectedIndex = (slashSelectedIndex - 1 + slashMatches.length) % slashMatches.length;
+              updateSlashMenu();
+              return;
+            } else if (e.key === 'Enter' || e.key === 'Tab') {
+              e.preventDefault();
+              if (slashMatches[slashSelectedIndex]) {
+                selectSlashCommand(slashMatches[slashSelectedIndex]);
+              }
+              return;
+            } else if (e.key === 'Escape') {
+              e.preventDefault();
+              menu.classList.remove('show');
+              return;
+            }
+          }
+
           if (e.key === 'Enter' && !e.shiftKey && !composing) {
             e.preventDefault();
             send();
