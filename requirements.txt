@@ -12,3 +12,5 @@ trafilatura>=1.10         # /api/fetch and /api/search page text extraction
 yfinance>=0.2.40          # stock fundamentals/news/consensus fallback (Yahoo Finance)
 alpaca-py>=0.30           # primary stock data: real-time quotes, bars, options
 pandas>=2.0               # used by /api/stock/* for indicator computation
+faster-whisper>=1.0       # /api/transcribe (voice in, CPU int8)
+piper-tts>=1.2            # /api/tts (voice out)

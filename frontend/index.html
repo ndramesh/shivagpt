@@ -641,6 +641,59 @@
       background: var(--bg-elev-2);
     }
 
+    /* Branch navigator on regenerated assistant messages — ◀ 1/N ▶ chip. */
+    .alt-nav {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      margin-left: 4px;
+      padding: 1px 4px;
+      border-radius: 4px;
+      background: var(--bg-elev-2);
+    }
+    .alt-arrow {
+      background: transparent;
+      border: none;
+      color: var(--text-2);
+      font-size: 11px;
+      padding: 0 4px;
+      cursor: pointer;
+      line-height: 1;
+    }
+    .alt-arrow:hover:not(:disabled) { color: var(--text-1); }
+    .alt-arrow:disabled { opacity: 0.3; cursor: default; }
+    .alt-count {
+      font-size: 11px;
+      color: var(--text-3);
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* Mic recording state — the otherwise-identical attach button gets a
+       red pulse so the user knows it's hot. */
+    .attach-btn.recording {
+      color: #ff4d4d;
+      animation: micPulse 1.1s ease-in-out infinite;
+    }
+    @keyframes micPulse {
+      0%, 100% { opacity: 1; transform: scale(1); }
+      50%      { opacity: 0.55; transform: scale(1.08); }
+    }
+    .attach-btn.transcribing {
+      color: var(--accent, #7c5cff);
+      opacity: 0.7;
+      cursor: wait;
+    }
+
+    /* Speaker button on assistant messages (matches .icon-btn dimensions but
+       gets the "active" treatment while audio is playing). */
+    .icon-btn.speaking {
+      color: var(--accent, #7c5cff);
+    }
+    .icon-btn.tts-loading {
+      opacity: 0.5;
+      cursor: wait;
+    }
+
     /* Reasoning-model "<think>...</think>" block, rendered as a collapsible
        widget at the top of the assistant message. */
     .think-block {
@@ -1799,6 +1852,12 @@
               <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
             </svg>
           </button>
+          <button class="attach-btn" id="micBtn" title="Voice input (click to start, click to stop)" aria-label="Voice input">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+              <path d="M19 10v2a7 7 0 0 1-14 0v-2M12 19v4M8 23h8" />
+            </svg>
+          </button>
           <textarea id="composer" rows="1" placeholder="Message ShivaGPT..." autofocus></textarea>
           <button class="send-btn" id="sendBtn" title="Send (Enter)" aria-label="Send">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
@@ -2047,7 +2106,8 @@
         { name: '/codereview', desc: 'Review code from a URL, ssh path, or local folder', hasArgs: true, hint: '[-model X] <path>' },
         { name: '/search', desc: 'Web search (SearXNG) + cited answer', hasArgs: true, hint: '[-model X] <query>' },
         { name: '/fetch', desc: 'Fetch a URL and answer questions about it', hasArgs: true, hint: '<url> [question]' },
-        { name: '/stock', desc: 'Stock quote + technicals + analyst consensus (Yahoo Finance, ~15min delayed)', hasArgs: true, hint: '<ticker> [options]' },
+        { name: '/stock', desc: 'Stock quote + technicals + analyst consensus (real-time via Alpaca)', hasArgs: true, hint: '<ticker> [options|news]' },
+        { name: '/portfolio', desc: 'Your Alpaca account: balances + open positions (read-only)', hasArgs: false },
       ];
 
       const BUILT_IN_PRESETS = [
@@ -2589,6 +2649,7 @@
           el('span', { class: 'who' }, isUser ? 'You' : (isSys ? 'System' : 'ShivaGPT')),
           m.model ? el('span', { class: 'model' }, '· ' + m.model) : null,
           renderTokChip(m),
+          renderAltNav(m),
           m.ts ? el('span', { class: 'ts' }, fmtTime(m.ts)) : null,
         );
         const content = el('div', { class: 'msg-content' });
@@ -2654,6 +2715,13 @@
               title: 'Regenerate',
               onclick: () => regenerate(m),
             }, 'Regenerate'));
+            // Speaker button → /api/tts. Click again to stop playback.
+            const speakBtn = el('button', {
+              class: 'icon-btn',
+              title: 'Read aloud (Piper TTS)',
+            }, 'Read');
+            speakBtn.addEventListener('click', () => speakMessage(m, speakBtn));
+            actions.appendChild(speakBtn);
           }
         }
 
@@ -2663,6 +2731,33 @@
         node.appendChild(av);
         node.appendChild(body);
         return node;
+      }
+
+      // ◀ 1/3 ▶ navigator that appears on assistant messages when there are
+      // alternative branches (i.e. you've regenerated at least once).
+      function renderAltNav(m) {
+        if (!m || m.role !== 'assistant') return null;
+        const alts = m.alternatives;
+        if (!Array.isArray(alts) || alts.length === 0) return null;
+        const total = alts.length + 1;
+        const cur = (typeof m.altIndex === 'number') ? m.altIndex : alts.length;
+        const wrap = el('span', { class: 'alt-nav', title: `Branch ${cur + 1} of ${total}` });
+        const prev = el('button', {
+          class: 'alt-arrow',
+          title: 'Previous branch',
+          onclick: (ev) => { ev.stopPropagation(); showAlternative(m, cur - 1); },
+        }, '◀');
+        prev.disabled = (cur <= 0);
+        const next = el('button', {
+          class: 'alt-arrow',
+          title: 'Next branch',
+          onclick: (ev) => { ev.stopPropagation(); showAlternative(m, cur + 1); },
+        }, '▶');
+        next.disabled = (cur >= total - 1);
+        wrap.appendChild(prev);
+        wrap.appendChild(el('span', { class: 'alt-count' }, `${cur + 1}/${total}`));
+        wrap.appendChild(next);
+        return wrap;
       }
 
       function renderTokChip(m) {
@@ -2850,6 +2945,177 @@
       /* ---------- Sending + streaming ---------- */
       /* ---------- Attachment state ---------- */
       let pendingFiles = [];  // { kind, filename, base64?, text?, mime, uploading? }
+
+      /* ---------- Voice input (MediaRecorder + /api/transcribe) ---------- */
+      let _voiceState = { recorder: null, chunks: [], stream: null, recording: false };
+
+      async function toggleVoiceRecording() {
+        if (_voiceState.recording) {
+          stopVoiceRecording();
+        } else {
+          await startVoiceRecording();
+        }
+      }
+
+      async function startVoiceRecording() {
+        if (!navigator.mediaDevices || !window.MediaRecorder) {
+          toast('Voice input not supported in this browser');
+          return;
+        }
+        try {
+          _voiceState.stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        } catch (e) {
+          console.error(e);
+          toast('Microphone permission denied');
+          return;
+        }
+        // Pick a mime the browser supports (webm/opus is widely supported)
+        const mimeOptions = ['audio/webm;codecs=opus', 'audio/webm', 'audio/mp4', 'audio/ogg'];
+        const mime = mimeOptions.find(m => MediaRecorder.isTypeSupported(m)) || '';
+        try {
+          _voiceState.recorder = new MediaRecorder(_voiceState.stream, mime ? { mimeType: mime } : undefined);
+        } catch (e) {
+          console.error(e);
+          _voiceState.stream.getTracks().forEach(t => t.stop());
+          _voiceState.stream = null;
+          toast('Could not create recorder');
+          return;
+        }
+        _voiceState.chunks = [];
+        _voiceState.recorder.ondataavailable = (e) => {
+          if (e.data && e.data.size > 0) _voiceState.chunks.push(e.data);
+        };
+        _voiceState.recorder.onstop = handleVoiceStop;
+        _voiceState.recorder.start();
+        _voiceState.recording = true;
+        $('micBtn').classList.add('recording');
+        $('micBtn').title = 'Click to stop recording';
+        toast('Recording… click mic again to stop');
+      }
+
+      function stopVoiceRecording() {
+        if (!_voiceState.recording) return;
+        try { _voiceState.recorder.stop(); } catch (e) { /* ignore */ }
+        _voiceState.recording = false;
+        $('micBtn').classList.remove('recording');
+        $('micBtn').classList.add('transcribing');
+      }
+
+      async function handleVoiceStop() {
+        // Release the mic immediately so the OS shows the indicator off.
+        if (_voiceState.stream) {
+          _voiceState.stream.getTracks().forEach(t => t.stop());
+          _voiceState.stream = null;
+        }
+        const blob = new Blob(_voiceState.chunks, { type: _voiceState.recorder.mimeType || 'audio/webm' });
+        _voiceState.chunks = [];
+        if (blob.size < 1000) {
+          $('micBtn').classList.remove('transcribing');
+          toast('Recording too short');
+          return;
+        }
+        const form = new FormData();
+        const ext = (blob.type.includes('mp4') ? '.mp4' : blob.type.includes('ogg') ? '.ogg' : '.webm');
+        form.append('file', blob, 'recording' + ext);
+
+        const composer = $('composer');
+        const prevDisabled = composer.disabled;
+        composer.disabled = true;
+        try {
+          const r = await fetch(apiUrl('/api/transcribe'), { method: 'POST', body: form });
+          if (!r.ok) {
+            let detail = '';
+            try { const j = await r.json(); detail = j.detail || JSON.stringify(j); }
+            catch { detail = await r.text(); }
+            throw new Error(detail || ('HTTP ' + r.status));
+          }
+          const data = await r.json();
+          const text = (data.text || '').trim();
+          if (text) {
+            const cur = composer.value;
+            composer.value = cur ? (cur + (cur.endsWith(' ') ? '' : ' ') + text) : text;
+            autoSize(composer);
+            composer.focus();
+            try { composer.setSelectionRange(composer.value.length, composer.value.length); } catch (e) {}
+          } else {
+            toast('No speech detected');
+          }
+        } catch (e) {
+          console.error(e);
+          toast('Transcription failed: ' + (e.message || e));
+        } finally {
+          $('micBtn').classList.remove('transcribing');
+          $('micBtn').title = 'Voice input (click to start, click to stop)';
+          composer.disabled = prevDisabled;
+        }
+      }
+
+      /* ---------- Voice output (TTS playback) ---------- */
+      // One <audio> element reused across all read-aloud actions; clicking the
+      // speaker button on a different message stops whatever's currently playing.
+      let _ttsAudio = null;
+      let _ttsButton = null;
+
+      async function speakMessage(msg, btn) {
+        // If this message is the one already playing, treat the click as Stop.
+        if (_ttsButton === btn && _ttsAudio && !_ttsAudio.paused) {
+          _ttsAudio.pause();
+          _ttsAudio.currentTime = 0;
+          btn.classList.remove('speaking');
+          _ttsAudio = null;
+          _ttsButton = null;
+          return;
+        }
+        // Stop any other in-flight playback first.
+        if (_ttsAudio) {
+          try { _ttsAudio.pause(); } catch (e) {}
+          if (_ttsButton) _ttsButton.classList.remove('speaking');
+          _ttsAudio = null;
+          _ttsButton = null;
+        }
+        const raw = (msg && msg.content) || '';
+        if (!raw.trim()) { toast('Nothing to read'); return; }
+        // Drop the <think> block — don't read internal reasoning aloud.
+        const text = stripThinking(raw);
+        if (!text.trim()) { toast('Only thinking content; nothing to read'); return; }
+
+        btn.classList.add('tts-loading');
+        try {
+          const r = await fetch(apiUrl('/api/tts'), {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ text }),
+          });
+          if (!r.ok) {
+            let detail = '';
+            try { const j = await r.json(); detail = j.detail || JSON.stringify(j); }
+            catch { detail = await r.text(); }
+            throw new Error(detail || ('HTTP ' + r.status));
+          }
+          const blob = await r.blob();
+          const url = URL.createObjectURL(blob);
+          _ttsAudio = new Audio(url);
+          _ttsButton = btn;
+          _ttsAudio.onended = () => {
+            btn.classList.remove('speaking');
+            URL.revokeObjectURL(url);
+            if (_ttsButton === btn) { _ttsAudio = null; _ttsButton = null; }
+          };
+          _ttsAudio.onerror = () => {
+            btn.classList.remove('speaking');
+            URL.revokeObjectURL(url);
+            toast('Audio playback failed');
+            if (_ttsButton === btn) { _ttsAudio = null; _ttsButton = null; }
+          };
+          btn.classList.remove('tts-loading');
+          btn.classList.add('speaking');
+          await _ttsAudio.play();
+        } catch (e) {
+          console.error(e);
+          btn.classList.remove('tts-loading');
+          toast('TTS failed: ' + (e.message || e));
+        }
+      }
 
       async function handleFileUpload(files) {
         for (const file of files) {
@@ -3348,25 +3614,103 @@
         toast('Loaded for editing — Enter to resend');
       }
 
+      // Regenerate keeps the displaced response as an alternative branch
+      // so the user can compare without losing the first answer.
+      //
+      // Storage model: an assistant message gains
+      //   m.alternatives = [{ content, model, tokensIn?, tokensOut?, ts }, ...]
+      //   m.altIndex     = which branch is currently displayed
+      //     (0 = stored alternatives[0], …, alternatives.length = the *current*
+      //      m.content; we always show the highest index by default after gen)
+      //
+      // showAlternative(m, i) swaps m.content + meta with the chosen branch
+      // and re-renders just that message.
       async function regenerate(assistantMsg) {
         const c = getActive(); if (!c) return;
         const idx = c.messages.indexOf(assistantMsg);
         if (idx < 0) return;
-        // Drop everything from this message onward, then re-stream from the previous user msg
-        c.messages.splice(idx);
-        // find last user message
-        const lastUserIdx = (() => { for (let i = c.messages.length - 1; i >= 0; i--) if (c.messages[i].role === 'user') return i; return -1; })();
-        if (lastUserIdx < 0) { renderActive(); return; }
-        // We won't re-add the user msg; just append a fresh assistant placeholder and stream
-        const newAsst = { role: 'assistant', content: '', ts: Date.now(), model: resolveModel(c.model) };
-        c.messages.push(newAsst);
+
+        // Stash the current response as an alternative before regenerating.
+        const snapshot = {
+          content: assistantMsg.content || '',
+          model: assistantMsg.model,
+          tokensIn: assistantMsg.tokensIn,
+          tokensOut: assistantMsg.tokensOut,
+          evalSeconds: assistantMsg.evalSeconds,
+          totalSeconds: assistantMsg.totalSeconds,
+          thinkingSeconds: assistantMsg.thinkingSeconds,
+          ts: assistantMsg.ts,
+        };
+        if (!Array.isArray(assistantMsg.alternatives)) assistantMsg.alternatives = [];
+        // Only stash non-empty snapshots — empty placeholders shouldn't pollute.
+        if (snapshot.content.trim()) assistantMsg.alternatives.push(snapshot);
+
+        // Reset current state for a fresh stream into the same message slot.
+        assistantMsg.content = '';
+        assistantMsg.model = resolveModel(c.model);
+        assistantMsg.tokensIn = undefined;
+        assistantMsg.tokensOut = undefined;
+        assistantMsg.evalSeconds = undefined;
+        assistantMsg.totalSeconds = undefined;
+        assistantMsg.thinkingSeconds = undefined;
+        assistantMsg.ts = Date.now();
+        assistantMsg.altIndex = assistantMsg.alternatives.length;   // future "new" slot
+
+        // Drop everything strictly after this message so context is identical
+        // to the original turn (the prior user msg + earlier history).
+        c.messages.splice(idx + 1);
+        c.updatedAt = Date.now();
         renderActive();
         const wrap = $('messages').querySelector('.msg-wrap');
         const node = wrap.lastElementChild;
         const contentEl = node.querySelector('.msg-content');
         const cursor = el('span', { class: 'typing-cursor' });
         contentEl.appendChild(cursor);
-        await streamChat(c, newAsst, contentEl, cursor);
+        await streamChat(c, assistantMsg, contentEl, cursor);
+      }
+
+      // Swap the currently-displayed branch on an assistant message. Index 0..N
+      // refers to m.alternatives[0..N-1] (older branches); index N is the
+      // most-recently-generated content stored on m itself.
+      function showAlternative(m, targetIdx) {
+        if (!m || !Array.isArray(m.alternatives)) return;
+        const total = m.alternatives.length + 1;   // alts + current
+        const cur = (typeof m.altIndex === 'number') ? m.altIndex : m.alternatives.length;
+        if (targetIdx < 0 || targetIdx >= total || targetIdx === cur) return;
+
+        // Capture the currently-visible state into the slot it came from
+        // before swapping in the new one.
+        const liveSnapshot = {
+          content: m.content || '',
+          model: m.model,
+          tokensIn: m.tokensIn,
+          tokensOut: m.tokensOut,
+          evalSeconds: m.evalSeconds,
+          totalSeconds: m.totalSeconds,
+          thinkingSeconds: m.thinkingSeconds,
+          ts: m.ts,
+        };
+        // The "current" position is the last index (alternatives.length).
+        // When we switch away from it, push it onto alternatives at the
+        // right slot; when we switch back, restore from there.
+        if (cur === m.alternatives.length) {
+          // Moving from live → an older branch. Park the live snapshot.
+          m._liveDraft = liveSnapshot;
+          const target = m.alternatives[targetIdx];
+          Object.assign(m, target);
+        } else {
+          // We were on alts[cur]; save its possibly-edited state back.
+          m.alternatives[cur] = liveSnapshot;
+          if (targetIdx === m.alternatives.length) {
+            // Going back to the live (newest) draft
+            const live = m._liveDraft || {};
+            Object.assign(m, live);
+          } else {
+            Object.assign(m, m.alternatives[targetIdx]);
+          }
+        }
+        m.altIndex = targetIdx;
+        renderActive();
       }
 
       /* ---------- Composer ---------- */
@@ -3885,6 +4229,59 @@
             break;
           }
 
+          case '/portfolio': {
+            if (!c) c = newConvo();
+            c.messages.push({ role: 'user', content: '/portfolio', ts: Date.now() });
+            autoTitleFromFirstUserMsg(c);
+            c.updatedAt = Date.now();
+            persistAll();
+            renderSidebar();
+            renderActive();
+
+            const loadingMsg = {
+              role: 'system',
+              content: '*Fetching your Alpaca portfolio…*',
+              ts: Date.now(),
+            };
+            c.messages.push(loadingMsg);
+            persistAll();
+            renderActive();
+            scrollToBottom();
+
+            try {
+              const r = await fetch(apiUrl('/api/portfolio'), {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: '{}',
+              });
+              if (!r.ok) {
+                let detail = '';
+                try { const j = await r.json(); detail = j.detail || JSON.stringify(j); }
+                catch { detail = await r.text(); }
+                throw new Error(detail || ('HTTP ' + r.status));
+              }
+              const data = await r.json();
+              const md = renderPortfolioReport(data);
+              const i = c.messages.indexOf(loadingMsg);
+              if (i >= 0) {
+                c.messages[i].content = md;
+                persistAll();
+                renderActive();
+                scrollToBottom();
+              }
+            } catch (e) {
+              console.error(e);
+              const i = c.messages.indexOf(loadingMsg);
+              if (i >= 0) {
+                c.messages[i].content = `*Failed to fetch portfolio: ${e.message}*`;
+                persistAll();
+                renderActive();
+              }
+              toast('Portfolio fetch failed');
+            }
+            break;
+          }
+
           case '/stock': {
             if (!args) {
               toast('Usage: /stock <ticker> [options|news]');
@@ -3965,6 +4362,58 @@
       // Render a stock dashboard as a single markdown blob. Kept inline as
       // markdown (not custom DOM) so it works with our existing assignContent
       // pipeline and re-renders cleanly when the message list does.
+      function renderPortfolioReport(data) {
+        const a = data.account || {};
+        const positions = data.positions || [];
+        const cur = a.currency || 'USD';
+        const fm = v => v == null ? 'n/a' :
+          (cur === 'USD' ? '$' : '') + Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
+        const fp = v => v == null ? 'n/a' : (v >= 0 ? '+' : '') + Number(v).toFixed(2) + '%';
+        const dayArrow = a.day_pl != null ? (a.day_pl >= 0 ? '▲' : '▼') : '';
+
+        let md = `## Portfolio · ${a.is_paper ? 'paper' : 'live'} account\n\n`;
+        if (a.trading_blocked) md += `> ⚠ **Trading is blocked on this account.**\n\n`;
+        md += `**${fm(a.portfolio_value)}** equity · `;
+        md += a.day_pl != null
+          ? `${dayArrow} ${fm(Math.abs(a.day_pl))} (${fp(a.day_pl_pct)}) today\n\n`
+          : `\n\n`;
+        md += `| | |\n|---|---|\n`;
+        md += `| Cash | ${fm(a.cash)} |\n`;
+        md += `| Buying power | ${fm(a.buying_power)} |\n`;
+        md += `| Last equity (prev close) | ${fm(a.last_equity)} |\n`;
+        md += `| Daytrade count | ${a.daytrade_count}${a.pattern_day_trader ? ' · PDT' : ''} |\n`;
+        md += `| Status | ${a.status} |\n\n`;
+
+        if (positions.length) {
+          md += `### Positions (${positions.length})\n\n`;
+          md += `| Symbol | Qty | Avg | Now | Mkt Value | Unrealized P&L | Day P&L |\n`;
+          md += `|---|---:|---:|---:|---:|---:|---:|\n`;
+          // Sort by absolute market value descending so biggest position is on top
+          positions.sort((a, b) => Math.abs((b.market_value || 0)) - Math.abs((a.market_value || 0)));
+          for (const p of positions) {
+            const upl = p.unrealized_pl;
+            const uplPct = p.unrealized_plpc;
+            const dpl = p.unrealized_intraday_pl;
+            const dplPct = p.unrealized_intraday_plpc;
+            const uplStr = upl != null
+              ? `${upl >= 0 ? '+' : ''}${fm(upl)}${uplPct != null ? ` (${fp(uplPct)})` : ''}`
+              : 'n/a';
+            const dplStr = dpl != null
+              ? `${dpl >= 0 ? '+' : ''}${fm(dpl)}${dplPct != null ? ` (${fp(dplPct)})` : ''}`
+              : 'n/a';
+            md += `| **${p.symbol}** | ${p.qty} | ${fm(p.avg_entry_price)} | ${fm(p.current_price)} | ${fm(p.market_value)} | ${uplStr} | ${dplStr} |\n`;
+          }
+          md += '\n';
+          md += `Tip: \`/stock ${positions[0].symbol}\` for a deep dive on your biggest position.\n\n`;
+        } else {
+          md += `*No open positions.*\n\n`;
+        }
+
+        md += `---\n\n`;
+        md += data.disclaimer || '';
+        return md;
+      }
+
       function renderStockReport(quote, analysis, opts, subcommand) {
         const fmtMoney = (v, cur) => v == null ? 'n/a' :
           ((cur || 'USD') === 'USD' ? '$' : (cur || '')) + Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
@@ -4594,6 +5043,9 @@
           if (e.target.files.length) handleFileUpload(e.target.files);
           e.target.value = '';  // reset so same file can be re-selected
         });
+
+        // Mic / voice input
+        $('micBtn').addEventListener('click', toggleVoiceRecording);
 
         // Drag-and-drop
         let dragCounter = 0;

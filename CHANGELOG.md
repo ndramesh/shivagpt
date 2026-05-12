@@ -5,6 +5,34 @@ All notable changes to ShivaGPT are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Voice input via faster-whisper.** A mic button in the composer
+  records audio (MediaRecorder → webm/opus), posts it to a new
+  `POST /api/transcribe` endpoint, which runs `faster-whisper`
+  (default `medium.en`, CPU int8) and returns the text. The result is
+  appended into the composer textarea so the user can review/edit
+  before sending. Click to start, click to stop. Env knobs:
+  `WHISPER_MODEL`, `WHISPER_DEVICE`, `WHISPER_COMPUTE_TYPE`.
+- **Voice output via Piper TTS.** Every assistant message gets a "Read"
+  button that hits `POST /api/tts` with the text (markdown stripped,
+  `<think>` blocks excluded), and plays the synthesized audio inline.
+  Click again to stop. Uses Piper's Python API for low per-call
+  overhead. Env knobs: `PIPER_VOICE` (default
+  `/home/shiva/services/piper-voices/en_US-amy-medium.onnx`),
+  `TTS_MAX_CHARS` (5000).
+- **`/portfolio` slash command + `POST /api/portfolio` endpoint.**
+  Pulls account balances (cash, equity, buying power, today's P&L)
+  and open positions (symbol, qty, avg entry, current price, market
+  value, unrealized P&L, day P&L) from your Alpaca account using
+  `TradingClient.get_account()` + `get_all_positions()` — both
+  strictly read-only, no order endpoints are wired anywhere on this
+  server. Positions table sorts by market value descending.
+- **Regenerate keeps alternative branches.** Clicking Regenerate no
+  longer clobbers the previous response; it stashes it as an
+  alternative and a small `◀ 1/N ▶` widget appears in the message
+  header so you can switch between branches. Each branch retains its
+  own token counts and timing.
+
+### Added
 - **Stock market data layer (Alpaca + yfinance hybrid).** Real-time
   quotes/bars from Alpaca (IEX feed on the free tier), supplemented with
   fundamentals / analyst consensus / news from yfinance (which Alpaca

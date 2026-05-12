@@ -338,6 +338,52 @@ API surface than Alpaca's contract-discovery flow). If you need
 real-time options quotes too, the Alpaca `OptionHistoricalDataClient`
 helpers are already wired up in `server.py` and can be plugged in.
 
+## Voice in (mic button) and voice out (read aloud)
+
+The composer has a microphone button next to the paperclip. Click to
+start recording (the icon pulses red), click again to stop. The audio
+is uploaded to `POST /api/transcribe`, which runs `faster-whisper`
+(default `medium.en` on Grace CPU, ~5-10× realtime), and the
+transcribed text is inserted into the composer so you can review and
+edit before sending. Browser permission for the microphone is
+required on first use.
+
+Every assistant message gets a **Read** button next to Copy and
+Regenerate. Clicking it hits `POST /api/tts` with the message text
+(markdown stripped, `<think>` reasoning excluded) and plays the
+generated audio inline using Piper TTS. Click again to stop.
+
+Env knobs (in the systemd unit):
+
+- `WHISPER_MODEL` — default `medium.en`. Try `large-v3` for top
+  accuracy at the cost of speed.
+- `WHISPER_DEVICE` — `cpu` (default) or `cuda` if you set up a
+  CUDA-enabled ctranslate2.
+- `PIPER_VOICE` — absolute path to a `.onnx` Piper voice. Default
+  expects `~/services/piper-voices/en_US-amy-medium.onnx`.
+
+## Portfolio (`/portfolio`)
+
+`/portfolio` shows your Alpaca account at a glance: cash, equity,
+buying power, day P&L, plus every open position with its avg entry,
+current price, market value, unrealized P&L, and day P&L — sorted by
+market value descending. Click a ticker mention in the table notes to
+drill into `/stock <symbol>`.
+
+This endpoint (`POST /api/portfolio`) is strictly read-only: the
+server calls `TradingClient.get_account()` and `get_all_positions()`
+and nothing else. There are no order-submission endpoints anywhere on
+this server. Requires `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` in
+the systemd unit (same keys used by `/stock`).
+
+## Regenerate keeps branches
+
+Hit **Regenerate** on an assistant message and the previous response
+isn't lost — it's stashed as an alternative branch. A `◀ 1/N ▶`
+widget appears in the message header; use the arrows to switch
+between branches without re-running anything. Each branch retains
+its own token counts, timing, and `<think>` reasoning.
+
 ## Streaming behavior
 
 Tokens append as they arrive. If the first token takes more than 4.5

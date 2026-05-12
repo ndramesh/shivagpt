@@ -1649,6 +1649,260 @@ async def stock_options(req: Request) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Portfolio (/api/portfolio) — read-only Alpaca account + positions
+#
+# READ-ONLY by construction: we only call get_account() and get_all_positions()
+# on the Alpaca TradingClient. No order submission, no order cancellation, no
+# position modifications. This server cannot place a trade.
+# ---------------------------------------------------------------------------
+
+@app.post("/api/portfolio")
+async def portfolio(req: Request) -> dict[str, Any]:
+    """Return Alpaca account balances + open positions. Requires APCA keys.
+
+    Strictly read-only — uses TradingClient.get_account() and get_all_positions()
+    only. No order endpoints touched.
+    """
+    tc = _alpaca_trading_client()
+    if tc is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Alpaca trading client not available. Set APCA_API_KEY_ID and "
+                   "APCA_API_SECRET_KEY in the systemd unit, and ensure alpaca-py is installed.",
+        )
+
+    def _do() -> dict[str, Any]:
+        try:
+            account = tc.get_account()
+            positions = tc.get_all_positions()
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Alpaca error: {e}")
+
+        def _f(x):
+            try:
+                return float(x)
+            except (TypeError, ValueError):
+                return None
+
+        equity = _f(account.equity)
+        last_equity = _f(account.last_equity)
+        day_pl = (equity - last_equity) if equity is not None and last_equity is not None else None
+        day_pl_pct = (day_pl / last_equity * 100) if (day_pl is not None and last_equity) else None
+
+        return {
+            "account": {
+                "status": str(account.status),
+                "currency": account.currency,
+                "cash": _f(account.cash),
+                "equity": equity,
+                "last_equity": last_equity,
+                "buying_power": _f(account.buying_power),
+                "portfolio_value": _f(account.portfolio_value),
+                "day_pl": day_pl,
+                "day_pl_pct": day_pl_pct,
+                "daytrade_count": int(getattr(account, "daytrade_count", 0) or 0),
+                "pattern_day_trader": bool(getattr(account, "pattern_day_trader", False)),
+                "trading_blocked": bool(getattr(account, "trading_blocked", False)),
+                "account_number": getattr(account, "account_number", None),
+                "is_paper": "paper" in (os.getenv("APCA_API_BASE_URL", "") or "paper").lower(),
+            },
+            "positions": [
+                {
+                    "symbol": p.symbol,
+                    "qty": _f(p.qty),
+                    "avg_entry_price": _f(p.avg_entry_price),
+                    "current_price": _f(getattr(p, "current_price", None)),
+                    "market_value": _f(p.market_value),
+                    "cost_basis": _f(p.cost_basis),
+                    "unrealized_pl": _f(p.unrealized_pl),
+                    "unrealized_plpc": _f(p.unrealized_plpc) * 100 if _f(p.unrealized_plpc) is not None else None,
+                    "unrealized_intraday_pl": _f(p.unrealized_intraday_pl),
+                    "unrealized_intraday_plpc": _f(p.unrealized_intraday_plpc) * 100 if _f(p.unrealized_intraday_plpc) is not None else None,
+                    "side": str(p.side),
+                    "asset_class": str(getattr(p, "asset_class", "us_equity")),
+                }
+                for p in positions
+            ],
+            "disclaimer": STOCK_DISCLAIMER,
+        }
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_do), timeout=15)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Portfolio fetch timed out")
+
+
+# ---------------------------------------------------------------------------
+# Voice input (/api/transcribe) — faster-whisper STT
+# ---------------------------------------------------------------------------
+
+_whisper_model = None
+WHISPER_MODEL_NAME = os.getenv("WHISPER_MODEL", "medium.en")
+WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu")
+WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE_TYPE", "int8")
+
+
+def _get_whisper():
+    """Lazy-load the whisper model. Cached after first call."""
+    global _whisper_model
+    if _whisper_model is None:
+        try:
+            from faster_whisper import WhisperModel
+        except ImportError as e:
+            raise HTTPException(status_code=500, detail=f"faster-whisper not installed: {e}")
+        log.info("Loading faster-whisper model=%s device=%s compute=%s",
+                 WHISPER_MODEL_NAME, WHISPER_DEVICE, WHISPER_COMPUTE)
+        _whisper_model = WhisperModel(
+            WHISPER_MODEL_NAME, device=WHISPER_DEVICE, compute_type=WHISPER_COMPUTE
+        )
+        log.info("Whisper loaded.")
+    return _whisper_model
+
+
+@app.post("/api/transcribe")
+async def transcribe(file: UploadFile = File(...)) -> dict[str, Any]:
+    """Transcribe an uploaded audio blob using faster-whisper.
+
+    Browser sends a webm/opus (or wav/mp3) blob from MediaRecorder; we
+    write it to a temp file (faster-whisper takes a path) and stream
+    segments back as one concatenated string. CPU int8 by default —
+    medium.en transcribes ~5-10x realtime on Grace CPU.
+    """
+    if not file.filename:
+        raise HTTPException(status_code=400, detail="No file uploaded")
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Empty audio")
+    if len(raw) > 100 * 1024 * 1024:
+        raise HTTPException(status_code=413, detail="Audio too large (max 100 MB)")
+
+    suffix = Path(file.filename).suffix or ".webm"
+    with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
+        tmp.write(raw)
+        tmp_path = tmp.name
+
+    def _do() -> dict[str, Any]:
+        m = _get_whisper()
+        segments, info = m.transcribe(tmp_path, beam_size=5, vad_filter=True)
+        text = " ".join(seg.text.strip() for seg in segments).strip()
+        return {
+            "text": text,
+            "language": info.language,
+            "duration_s": float(info.duration),
+            "model": WHISPER_MODEL_NAME,
+        }
+
+    log.info("transcribe: %s (%d KB)", file.filename, len(raw) // 1024)
+    t0 = time.monotonic()
+    try:
+        result = await asyncio.wait_for(asyncio.to_thread(_do), timeout=300)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Transcription timed out")
+    except Exception as e:
+        log.exception("transcribe failed")
+        raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}")
+    finally:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+    elapsed = time.monotonic() - t0
+    log.info("transcribe: %.2fs of audio in %.2fs (%.1fx realtime), %d chars",
+             result["duration_s"], elapsed,
+             result["duration_s"] / max(elapsed, 0.001), len(result["text"]))
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Voice output (/api/tts) — Piper TTS
+# ---------------------------------------------------------------------------
+
+_piper_voice = None
+PIPER_VOICE_PATH = os.getenv(
+    "PIPER_VOICE",
+    "/home/shiva/services/piper-voices/en_US-amy-medium.onnx",
+)
+TTS_MAX_CHARS = int(os.getenv("TTS_MAX_CHARS", "5000"))
+
+
+def _get_piper():
+    """Lazy-load the Piper voice. Cached after first call."""
+    global _piper_voice
+    if _piper_voice is None:
+        try:
+            from piper import PiperVoice
+        except ImportError as e:
+            raise HTTPException(status_code=500, detail=f"piper-tts not installed: {e}")
+        if not Path(PIPER_VOICE_PATH).exists():
+            raise HTTPException(
+                status_code=500,
+                detail=f"Piper voice not found at {PIPER_VOICE_PATH}. "
+                       "Set PIPER_VOICE env to the correct .onnx path.",
+            )
+        log.info("Loading Piper voice from %s", PIPER_VOICE_PATH)
+        _piper_voice = PiperVoice.load(PIPER_VOICE_PATH)
+        log.info("Piper voice loaded.")
+    return _piper_voice
+
+
+def _strip_markdown_for_tts(text: str) -> str:
+    """Remove markdown characters / code blocks so TTS reads the words, not the syntax."""
+    s = text or ""
+    s = re.sub(r"```[\s\S]*?```", " (code block omitted) ", s)
+    s = re.sub(r"`([^`]+)`", r"\1", s)
+    s = re.sub(r"\*\*([^*]+)\*\*", r"\1", s)
+    s = re.sub(r"\*([^*]+)\*", r"\1", s)
+    s = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", s)
+    s = re.sub(r"^#{1,6}\s+", "", s, flags=re.M)
+    s = re.sub(r"<details[^>]*>[\s\S]*?</details>", "", s)
+    s = re.sub(r"<[^>]+>", "", s)
+    s = re.sub(r"\n{3,}", "\n\n", s)
+    return s.strip()
+
+
+@app.post("/api/tts")
+async def tts(req: Request) -> Response:
+    """Synthesize speech from text using Piper. Returns audio/wav bytes."""
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing 'text'")
+
+    clean = _strip_markdown_for_tts(text)
+    if not clean:
+        raise HTTPException(status_code=400, detail="Nothing speakable in the input")
+    if len(clean) > TTS_MAX_CHARS:
+        clean = clean[:TTS_MAX_CHARS] + " ... (truncated for speech)"
+
+    def _do() -> bytes:
+        import wave
+        voice = _get_piper()
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wf:
+            voice.synthesize(clean, wf)
+        return buf.getvalue()
+
+    log.info("tts: %d chars", len(clean))
+    t0 = time.monotonic()
+    try:
+        audio = await asyncio.wait_for(asyncio.to_thread(_do), timeout=120)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="TTS timed out")
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("tts failed")
+        raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}")
+    log.info("tts: done in %.2fs (%d KB)", time.monotonic() - t0, len(audio) // 1024)
+    return Response(content=audio, media_type="audio/wav",
+                    headers={"Cache-Control": "no-cache"})
+
+
+# ---------------------------------------------------------------------------
 # State Synchronization & Auth
 # ---------------------------------------------------------------------------
 
