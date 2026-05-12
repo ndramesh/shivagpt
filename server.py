@@ -1362,6 +1362,10 @@ async def _stream_ollama_chat(model: str, system: str, user: str,
     """Generic NDJSON streamer: preamble first, then Ollama's tokens, in the
     /api/chat shape so the frontend reader can be reused unchanged.
 
+    Also emits a leading {"meta": {"model": ...}} line so the frontend can
+    update the assistant message badge to reflect what model actually ran
+    server-side, rather than guessing from the conversation's current model.
+
     Yields bytes ready to push into a StreamingResponse.
     """
     upstream = json.dumps({
@@ -1374,6 +1378,8 @@ async def _stream_ollama_chat(model: str, system: str, user: str,
         "options": {"temperature": temperature},
     }).encode("utf-8")
 
+    # Tell the frontend what model actually ran (not what the convo's set to).
+    yield (json.dumps({"meta": {"model": model}}) + "\n").encode()
     if preamble:
         yield (json.dumps({"message": {"role": "assistant",
                                         "content": preamble}}) + "\n").encode()
@@ -1453,7 +1459,7 @@ async def web_search(req: Request) -> StreamingResponse:
     fetched_note = (f"_Fetched full text of **{len(pages)}** result(s)._\n\n"
                     if pages else "_No full-text fetch; using snippets only._\n\n")
     preamble = (
-        f"_Searching for **{query}** via SearXNG…_\n\n"
+        f"_Searching for **{query}** via SearXNG · model `{model}`…_\n\n"
         f"<details><summary>Search results</summary>\n\n{preview_lines}\n\n</details>\n\n"
         f"{fetched_note}"
     )
@@ -1512,7 +1518,7 @@ async def fetch_url(req: Request) -> StreamingResponse:
     )
 
     preamble = (
-        f"_Fetched **{len(text):,}** chars from [{title}]({url})._\n\n"
+        f"_Fetched **{len(text):,}** chars from [{title}]({url}) · model `{model}`._\n\n"
     )
 
     return StreamingResponse(

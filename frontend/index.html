@@ -3605,6 +3605,17 @@
               let obj;
               try { obj = JSON.parse(line); } catch (e) { continue; }
               if (obj.error) throw new Error(obj.error);
+              // Server-side endpoints emit a leading {meta:{model:...}} so
+              // the badge reflects the model that actually ran, not the
+              // convo's current model (which can disagree with the server's
+              // SEARCH_DEFAULT_MODEL).
+              if (obj.meta && obj.meta.model) {
+                assistantMsg.model = obj.meta.model;
+                const node = contentEl.closest('.msg');
+                const chip = node && node.querySelector('.model');
+                if (chip) chip.textContent = '· ' + obj.meta.model;
+                continue;
+              }
               if (firstToken) {
                 firstToken = false;
                 const sb = $('slow-banner-' + assistantMsg.ts);
