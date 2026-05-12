@@ -197,6 +197,35 @@ from once:
 ssh kailash 'ssh-keyscan -H your-other-box >> ~/.ssh/known_hosts'
 ```
 
+## Web search (`/search`) and URL fetch (`/fetch`)
+
+`/search` runs a query through a local SearXNG instance, pulls full
+text from the top results, and streams a cited answer:
+
+```
+/search current best free image-gen models
+/search -model llama3.3 weather in Mountain View tomorrow -- one line only
+/fetch https://news.ycombinator.com/item?id=12345
+/fetch https://en.wikipedia.org/wiki/Stuff   summarize in 5 bullets
+```
+
+The answer is prefaced with a collapsible "Search results" block that
+shows every URL the model was given access to, and the model is
+prompted to cite claims as `[1]`, `[2]`, etc. matching that list.
+
+You need SearXNG running locally (see the install commands in the
+project notes). Env vars on the ShivaGPT server side:
+
+- `SEARXNG_URL` — default `http://localhost:8888`.
+- `SEARCH_DEFAULT_MODEL` — default `llama3.3`.
+- `SEARCH_DEFAULT_RESULTS` — how many results to surface (6).
+- `SEARCH_DEFAULT_FETCH` — how many top results to pull full text from (3).
+- `SEARCH_FETCH_MAX_CHARS` — per-page text cap (8 000).
+- `FETCH_MAX_CHARS` — single-page cap for `/api/fetch` (40 000).
+- `FETCH_TIMEOUT_S` — per-URL fetch timeout (15 s).
+
+Like `/codereview`, both endpoints require an admin login (`/login`).
+
 ## Streaming behavior
 
 Tokens append as they arrive. If the first token takes more than 4.5

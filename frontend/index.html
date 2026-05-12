@@ -1968,6 +1968,8 @@
         { name: '/debug', desc: 'Show system debug info', hasArgs: false },
         { name: '/imgen', desc: 'Generate an image', hasArgs: true, hint: '<description>' },
         { name: '/codereview', desc: 'Review code from a URL, ssh path, or local folder', hasArgs: true, hint: '[-model X] <path>' },
+        { name: '/search', desc: 'Web search (SearXNG) + cited answer', hasArgs: true, hint: '[-model X] <query>' },
+        { name: '/fetch', desc: 'Fetch a URL and answer questions about it', hasArgs: true, hint: '<url> [question]' },
       ];
 
       const BUILT_IN_PRESETS = [
@@ -3450,8 +3452,197 @@
               { model: crModel, path: crPath, instructions: crInstr });
             break;
           }
+
+          case '/search': {
+            if (!args) {
+              toast('Usage: /search [-model <model>] <query> [optional instructions]');
+              break;
+            }
+            // Parse: optional -model X, then everything else is the query
+            // (until trailing instructions are introduced via " -- ").
+            let sModel = '';
+            let rest = args.trim();
+            const sm = rest.match(/^(?:-m|-model|--model)\s+(\S+)\s+(.*)$/);
+            if (sm) { sModel = sm[1]; rest = sm[2].trim(); }
+            // Allow `/search foo bar -- give me five bullets` for trailing
+            // instructions (-- isn't a typical search keyword).
+            let sQuery = rest, sInstr = '';
+            const dashIdx = rest.indexOf(' -- ');
+            if (dashIdx >= 0) {
+              sQuery = rest.slice(0, dashIdx).trim();
+              sInstr = rest.slice(dashIdx + 4).trim();
+            }
+            if (!sQuery) { toast('Missing <query>'); break; }
+            if (!state.adminToken) { toast('Admin login required — run /login first'); break; }
+            if (!c) c = newConvo();
+
+            const echo = `/search${sModel ? ` -model ${sModel}` : ''} ${sQuery}${sInstr ? `  -- ${sInstr}` : ''}`;
+            c.messages.push({ role: 'user', content: echo, ts: Date.now() });
+            autoTitleFromFirstUserMsg(c);
+            c.updatedAt = Date.now();
+            persistAll();
+            renderSidebar();
+            renderActive();
+
+            const asst = { role: 'assistant', content: '', ts: Date.now(), model: sModel || resolveModel(c.model) };
+            c.messages.push(asst);
+            const wrap = $('messages').querySelector('.msg-wrap') || (() => {
+              const n = el('div', { class: 'msg-wrap' });
+              $('messages').innerHTML = ''; $('messages').appendChild(n);
+              return n;
+            })();
+            const node = renderMsg(asst);
+            wrap.appendChild(node);
+            const contentEl = node.querySelector('.msg-content');
+            const cursor = el('span', { class: 'typing-cursor' });
+            contentEl.appendChild(cursor);
+            scrollToBottom();
+
+            await streamFromEndpoint('/api/search', {
+              model: sModel || undefined,
+              query: sQuery,
+              instructions: sInstr || '',
+            }, c, asst, contentEl, cursor, 'Searching the web…');
+            break;
+          }
+
+          case '/fetch': {
+            if (!args) {
+              toast('Usage: /fetch <url> [question]');
+              break;
+            }
+            const firstSp = args.indexOf(' ');
+            const fUrl = firstSp < 0 ? args.trim() : args.slice(0, firstSp).trim();
+            const fInstr = firstSp < 0 ? '' : args.slice(firstSp + 1).trim();
+            if (!/^https?:\/\//i.test(fUrl)) {
+              toast('Fetch needs a full http(s):// URL');
+              break;
+            }
+            if (!state.adminToken) { toast('Admin login required — run /login first'); break; }
+            if (!c) c = newConvo();
+
+            const echo = `/fetch ${fUrl}${fInstr ? `  ${fInstr}` : ''}`;
+            c.messages.push({ role: 'user', content: echo, ts: Date.now() });
+            autoTitleFromFirstUserMsg(c);
+            c.updatedAt = Date.now();
+            persistAll();
+            renderSidebar();
+            renderActive();
+
+            const asst = { role: 'assistant', content: '', ts: Date.now(), model: resolveModel(c.model) };
+            c.messages.push(asst);
+            const wrap = $('messages').querySelector('.msg-wrap') || (() => {
+              const n = el('div', { class: 'msg-wrap' });
+              $('messages').innerHTML = ''; $('messages').appendChild(n);
+              return n;
+            })();
+            const node = renderMsg(asst);
+            wrap.appendChild(node);
+            const contentEl = node.querySelector('.msg-content');
+            const cursor = el('span', { class: 'typing-cursor' });
+            contentEl.appendChild(cursor);
+            scrollToBottom();
+
+            await streamFromEndpoint('/api/fetch', {
+              url: fUrl,
+              instructions: fInstr || '',
+            }, c, asst, contentEl, cursor, 'Fetching the page…');
+            break;
+          }
         }
         return true;
+      }
+
+      // Generic NDJSON streamer used by /search and /fetch. Mirrors streamChat
+      // and streamCodeReview but expressed once so adding the next slash
+      // command doesn't mean another 60-line copy. The shared shape is:
+      //   POST endpoint with JSON body + admin Bearer token,
+      //   server returns NDJSON with {message:{content:"..."}} chunks,
+      //   final chunk has {done: true, prompt_eval_count, eval_count, ...}.
+      async function streamFromEndpoint(endpoint, body, convo, assistantMsg,
+                                         contentEl, cursorEl, slowMsg) {
+        state.streaming = true;
+        setSendButtonState(true);
+        state.abortController = new AbortController();
+
+        const slowTimer = setTimeout(() => {
+          if (state.streaming && !assistantMsg.content) {
+            contentEl.appendChild(el('div', { class: 'info-banner', id: 'slow-banner-' + assistantMsg.ts },
+              slowMsg || 'Still working…'));
+          }
+        }, 4500);
+
+        let buf = '';
+        let firstToken = true;
+        try {
+          const r = await fetch(apiUrl(endpoint), {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              'Authorization': `Bearer ${state.adminToken || ''}`,
+            },
+            body: JSON.stringify(body),
+            signal: state.abortController.signal,
+          });
+          if (!r.ok) {
+            let detail = '';
+            try { const j = await r.json(); detail = j.detail || JSON.stringify(j); }
+            catch { detail = await r.text(); }
+            throw new Error(`Server returned ${r.status}: ${(detail || '').slice(0, 500)}`);
+          }
+          if (!r.body) throw new Error('No response body — streaming unsupported in this browser?');
+          const reader = r.body.getReader();
+          const decoder = new TextDecoder();
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            buf += decoder.decode(value, { stream: true });
+            let idx;
+            while ((idx = buf.indexOf('\n')) >= 0) {
+              const line = buf.slice(0, idx).trim();
+              buf = buf.slice(idx + 1);
+              if (!line) continue;
+              let obj;
+              try { obj = JSON.parse(line); } catch (e) { continue; }
+              if (obj.error) throw new Error(obj.error);
+              if (firstToken) {
+                firstToken = false;
+                const sb = $('slow-banner-' + assistantMsg.ts);
+                if (sb) sb.remove();
+              }
+              const piece = (obj.message && obj.message.content) || '';
+              if (piece) {
+                assistantMsg.content += piece;
+                if (cursorEl.parentNode === contentEl) contentEl.removeChild(cursorEl);
+                assignContent(contentEl, assistantMsg.content, true);
+                contentEl.appendChild(cursorEl);
+                scrollToBottom();
+              }
+              if (obj.done) {
+                if (typeof obj.prompt_eval_count === 'number') assistantMsg.tokensIn = obj.prompt_eval_count;
+                if (typeof obj.eval_count === 'number') assistantMsg.tokensOut = obj.eval_count;
+                if (typeof obj.eval_duration === 'number') assistantMsg.evalSeconds = obj.eval_duration / 1e9;
+                if (typeof obj.total_duration === 'number') assistantMsg.totalSeconds = obj.total_duration / 1e9;
+                const n2 = contentEl.closest('.msg');
+                if (n2) updateTokChipInPlace(n2, assistantMsg);
+                updateCtxMeter();
+                break;
+              }
+            }
+          }
+        } catch (e) {
+          if (e.name === 'AbortError') appendError(contentEl, 'Stopped by you.');
+          else { console.error(e); appendError(contentEl, friendlyError(e)); }
+        } finally {
+          clearTimeout(slowTimer);
+          if (cursorEl.parentNode === contentEl) contentEl.removeChild(cursorEl);
+          state.streaming = false;
+          state.abortController = null;
+          setSendButtonState(false);
+          convo.updatedAt = Date.now();
+          persistAll();
+          renderSidebar();
+        }
       }
 
       async function streamCodeReview(convo, assistantMsg, contentEl, cursorEl, payload) {

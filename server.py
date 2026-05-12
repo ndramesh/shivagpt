@@ -1222,6 +1222,306 @@ async def code_review(req: Request) -> StreamingResponse:
     )
 
 
+# ---------------------------------------------------------------------------
+# Web search & URL fetch (/api/search, /api/fetch)
+#
+# /api/search: query SearXNG, optionally fetch the top-N pages' main text,
+#   then stream a cited answer from Ollama (same NDJSON shape as /api/chat).
+# /api/fetch:  pull one URL, extract main article text, and stream a model
+#   response that uses it as context.
+#
+# Both are admin-gated, matching /codereview, because /fetch can be aimed
+# at internal LAN URLs and /search inherits the same surface.
+# ---------------------------------------------------------------------------
+
+SEARXNG_URL = os.getenv("SEARXNG_URL", "http://localhost:8888").rstrip("/")
+SEARCH_DEFAULT_RESULTS = int(os.getenv("SEARCH_DEFAULT_RESULTS", "6"))
+SEARCH_DEFAULT_FETCH = int(os.getenv("SEARCH_DEFAULT_FETCH", "3"))
+SEARCH_FETCH_MAX_CHARS = int(os.getenv("SEARCH_FETCH_MAX_CHARS", "8000"))   # per page
+FETCH_MAX_CHARS = int(os.getenv("FETCH_MAX_CHARS", "40000"))                 # /api/fetch single page cap
+FETCH_TIMEOUT_S = float(os.getenv("FETCH_TIMEOUT_S", "15"))
+
+
+def _extract_main_text(html: str) -> str:
+    """Pull the main article text out of an HTML page.
+
+    Tries trafilatura first (best quality); falls back to a crude tag-strip
+    so the endpoint still works if trafilatura isn't installed.
+    """
+    try:
+        import trafilatura  # type: ignore
+        out = trafilatura.extract(
+            html,
+            include_links=False,
+            include_images=False,
+            include_tables=False,
+            favor_recall=True,
+            no_fallback=False,
+        ) or ""
+        if out.strip():
+            return out
+    except Exception as e:  # pragma: no cover
+        log.debug("trafilatura unavailable or failed: %s", e)
+
+    # Fallback: kill <script>/<style>, strip tags, collapse whitespace.
+    cleaned = re.sub(r"(?is)<(script|style)[^>]*>.*?</\1>", " ", html)
+    cleaned = re.sub(r"(?s)<[^>]+>", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    return cleaned
+
+
+async def _searxng_search(query: str, num: int) -> list[dict]:
+    """Returns [{title, url, snippet, engine}] from the SearXNG JSON API."""
+    params = {"q": query, "format": "json", "safesearch": "0"}
+    async with httpx.AsyncClient(timeout=20.0,
+                                 headers={"User-Agent": "shivagpt-search/1.0"}) as cli:
+        try:
+            r = await cli.get(f"{SEARXNG_URL}/search", params=params)
+        except httpx.ConnectError as e:
+            raise HTTPException(status_code=502,
+                                detail=f"Cannot reach SearXNG at {SEARXNG_URL}: {e}")
+        if r.status_code != 200:
+            raise HTTPException(status_code=502,
+                                detail=f"SearXNG returned {r.status_code}: {r.text[:200]}")
+        try:
+            data = r.json()
+        except Exception:
+            raise HTTPException(status_code=502,
+                                detail="SearXNG didn't return JSON — is the json format enabled "
+                                       "in /etc/searxng/settings.yml?")
+    results = []
+    for item in (data.get("results") or [])[:num]:
+        url = (item.get("url") or "").strip()
+        if not url:
+            continue
+        results.append({
+            "title": (item.get("title") or url).strip(),
+            "url": url,
+            "snippet": (item.get("content") or "").strip(),
+            "engine": item.get("engine", ""),
+        })
+    return results
+
+
+async def _fetch_one(url: str, max_chars: int) -> tuple[str, str]:
+    """Returns (title, text). Title comes from <title>; text is main content."""
+    async with httpx.AsyncClient(
+        timeout=FETCH_TIMEOUT_S,
+        follow_redirects=True,
+        headers={"User-Agent": "shivagpt-fetch/1.0 (+private LAN assistant)"},
+    ) as cli:
+        r = await cli.get(url)
+        r.raise_for_status()
+        # Skip obviously non-HTML responses; the model can't do much with bytes.
+        ctype = (r.headers.get("content-type") or "").lower()
+        if any(t in ctype for t in ("image/", "audio/", "video/", "application/pdf",
+                                     "application/zip", "application/octet-stream")):
+            raise HTTPException(status_code=415,
+                                detail=f"Cannot extract text from content-type: {ctype}")
+        body = r.text
+    # title
+    m = re.search(r"(?is)<title[^>]*>(.*?)</title>", body)
+    title = re.sub(r"\s+", " ", m.group(1)).strip() if m else url
+    text = await asyncio.to_thread(_extract_main_text, body)
+    if not text:
+        raise HTTPException(status_code=502,
+                            detail=f"Could not extract any text from {url}")
+    return title, text[:max_chars]
+
+
+def _build_search_prompt(query: str, results: list[dict],
+                         pages: list[dict], instructions: str) -> tuple[str, str]:
+    """Compose a (system, user) prompt that grounds the answer in search results."""
+    system = (
+        "You are a careful research assistant. Use the search results below to "
+        "answer the user's question. Cite each claim that comes from a result "
+        "using bracketed numbers like [1], [2] that match the result list. If "
+        "the results disagree or don't actually answer the question, say so "
+        "openly. Don't invent facts that aren't in the results. End with a "
+        "one-line 'Sources:' section that lists [n] title — url for every "
+        "citation you used."
+    )
+    parts = [f"# Question\n{query}\n"]
+    if instructions:
+        parts.append(f"# Additional instructions\n{instructions}\n")
+    parts.append("# Search results")
+    for i, r in enumerate(results, 1):
+        parts.append(f"\n[{i}] **{r['title']}** — {r['url']}")
+        if r.get("snippet"):
+            parts.append(f"    {r['snippet']}")
+    if pages:
+        parts.append("\n# Full text of top results")
+        for p in pages:
+            parts.append(f"\n## [{p['index']}] {p['title']}\nURL: {p['url']}\n\n{p['text']}\n")
+    user = "\n".join(parts)
+    return system, user
+
+
+async def _stream_ollama_chat(model: str, system: str, user: str,
+                               temperature: float, preamble: str):
+    """Generic NDJSON streamer: preamble first, then Ollama's tokens, in the
+    /api/chat shape so the frontend reader can be reused unchanged.
+
+    Yields bytes ready to push into a StreamingResponse.
+    """
+    upstream = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "stream": True,
+        "options": {"temperature": temperature},
+    }).encode("utf-8")
+
+    if preamble:
+        yield (json.dumps({"message": {"role": "assistant",
+                                        "content": preamble}}) + "\n").encode()
+    timeout = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as c:
+            async with c.stream("POST", f"{OLLAMA_URL}/api/chat",
+                                content=upstream,
+                                headers={"content-type": "application/json"}) as r:
+                if r.status_code != 200:
+                    text = await r.aread()
+                    msg = text.decode("utf-8", errors="replace")
+                    yield (json.dumps({"error": msg, "status": r.status_code}) + "\n").encode()
+                    return
+                async for chunk in r.aiter_raw():
+                    if chunk:
+                        yield chunk
+    except httpx.ConnectError:
+        yield (json.dumps({"error": f"Cannot connect to Ollama at {OLLAMA_URL}."}) + "\n").encode()
+    except httpx.ReadTimeout:
+        yield (json.dumps({"error": "Ollama timed out while generating."}) + "\n").encode()
+    except Exception as e:
+        log.exception("ollama stream failed")
+        yield (json.dumps({"error": f"Server error: {e.__class__.__name__}: {e}"}) + "\n").encode()
+
+
+@app.post("/api/search")
+async def web_search(req: Request) -> StreamingResponse:
+    """Search via SearXNG, fetch top-N page texts, stream a cited answer."""
+    _check_auth(req)
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    query = (body.get("query") or "").strip()
+    if not query:
+        raise HTTPException(status_code=400, detail="Missing 'query'")
+
+    model = (body.get("model") or "").strip() or os.getenv("SEARCH_DEFAULT_MODEL", "llama3.3")
+    instructions = (body.get("instructions") or "").strip()
+    num_results = max(1, min(int(body.get("num_results") or SEARCH_DEFAULT_RESULTS), 15))
+    fetch_top = max(0, min(int(body.get("fetch_top") or SEARCH_DEFAULT_FETCH), num_results))
+    try:
+        temperature = float(body.get("temperature", 0.3))
+    except (TypeError, ValueError):
+        temperature = 0.3
+
+    log.info("search: q=%r num=%d fetch_top=%d model=%s", query, num_results, fetch_top, model)
+
+    # 1. Get search results
+    results = await _searxng_search(query, num_results)
+    if not results:
+        raise HTTPException(status_code=502,
+                            detail=f"SearXNG returned no results for {query!r}")
+
+    # 2. Fetch the top-N page texts (best-effort; failures are skipped silently)
+    pages: list[dict] = []
+    if fetch_top > 0:
+        async def _maybe_fetch(i: int, r: dict):
+            try:
+                title, text = await _fetch_one(r["url"], SEARCH_FETCH_MAX_CHARS)
+                return {"index": i, "title": title or r["title"], "url": r["url"], "text": text}
+            except Exception as e:
+                log.debug("search: skip fetch %s: %s", r["url"], e)
+                return None
+        fetched = await asyncio.gather(*[_maybe_fetch(i + 1, r) for i, r in enumerate(results[:fetch_top])])
+        pages = [p for p in fetched if p]
+
+    system, user = _build_search_prompt(query, results, pages, instructions)
+
+    # Preamble shows the user what was found before any tokens stream in.
+    preview_lines = "\n".join(
+        f"  [{i+1}] [{r['title']}]({r['url']})" + (f"  · _{r['engine']}_" if r.get("engine") else "")
+        for i, r in enumerate(results)
+    )
+    fetched_note = (f"_Fetched full text of **{len(pages)}** result(s)._\n\n"
+                    if pages else "_No full-text fetch; using snippets only._\n\n")
+    preamble = (
+        f"_Searching for **{query}** via SearXNG…_\n\n"
+        f"<details><summary>Search results</summary>\n\n{preview_lines}\n\n</details>\n\n"
+        f"{fetched_note}"
+    )
+
+    return StreamingResponse(
+        _stream_ollama_chat(model, system, user, temperature, preamble),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+@app.post("/api/fetch")
+async def fetch_url(req: Request) -> StreamingResponse:
+    """Fetch a single URL, extract main text, stream a model response."""
+    _check_auth(req)
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    url = (body.get("url") or "").strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing 'url'")
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=400, detail="URL must start with http:// or https://")
+
+    model = (body.get("model") or "").strip() or os.getenv("SEARCH_DEFAULT_MODEL", "llama3.3")
+    instructions = (body.get("instructions") or "").strip()
+    try:
+        temperature = float(body.get("temperature", 0.3))
+    except (TypeError, ValueError):
+        temperature = 0.3
+
+    log.info("fetch: url=%s model=%s", url, model)
+
+    try:
+        title, text = await _fetch_one(url, FETCH_MAX_CHARS)
+    except httpx.HTTPStatusError as e:
+        raise HTTPException(status_code=502, detail=f"Fetch failed: {e}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        log.exception("fetch: unexpected error")
+        raise HTTPException(status_code=502, detail=f"Fetch failed: {e.__class__.__name__}: {e}")
+
+    system = (
+        "You are reading a single web page on the user's behalf. Answer their "
+        "question using only the page content provided. If the answer isn't in "
+        "the page, say so. Quote sparingly and accurately."
+    )
+    default_instr = "Summarize this page in clear bullet points."
+    user_q = instructions or default_instr
+    user = (
+        f"# URL\n{url}\n\n# Title\n{title}\n\n# Page content\n{text}\n\n"
+        f"# Question\n{user_q}"
+    )
+
+    preamble = (
+        f"_Fetched **{len(text):,}** chars from [{title}]({url})._\n\n"
+    )
+
+    return StreamingResponse(
+        _stream_ollama_chat(model, system, user, temperature, preamble),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
 @app.post("/api/cancel/{model}")
 async def cancel(model: str) -> dict:
     """Best-effort: ask Ollama to stop loading the given model.

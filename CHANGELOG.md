@@ -5,6 +5,27 @@ All notable changes to ShivaGPT are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`/search` slash command** — web search backed by SearXNG running on
+  the same host. Streams a cited answer that grounds the model in
+  fresh web results. Fetches the top-N pages' main article text (via
+  `trafilatura` with a tag-strip fallback) so the model has real
+  content to cite from, not just snippets. Optional `-model X` flag,
+  optional `-- trailing instructions` after the query.
+- **`/fetch` slash command** — pull a single URL, extract main text,
+  and stream a model response that uses it as context. Useful for
+  "summarize this page" / "what does this say about Y" workflows.
+- **`POST /api/search` and `POST /api/fetch` endpoints** — auth-gated
+  via the existing admin token. Talk to a local SearXNG at
+  `SEARXNG_URL` (default `http://localhost:8888`). Knobs:
+  `SEARCH_DEFAULT_RESULTS` (6), `SEARCH_DEFAULT_FETCH` (3),
+  `SEARCH_FETCH_MAX_CHARS` (8 000 per page),
+  `FETCH_MAX_CHARS` (40 000 for `/api/fetch`),
+  `FETCH_TIMEOUT_S` (15), `SEARCH_DEFAULT_MODEL` (`llama3.3`).
+- **Generic `streamFromEndpoint()` frontend helper** — single shared
+  NDJSON streamer used by `/search` and `/fetch`. `streamChat` and
+  `streamCodeReview` remain as-is for now to avoid churn; future
+  commands should use the generic helper.
+
 - **`/codereview` slash command** — review code from a GitHub URL, an
   ssh-style git remote (`git@github.com:owner/repo[.git]`), any other
   `http(s)://` URL, an SSH filesystem path (`user@host:/path`), or a

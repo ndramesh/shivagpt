@@ -8,3 +8,4 @@ torch>=2.0.0              # image generation
 diffusers>=0.27.0         # image generation
 transformers>=4.38.0      # image generation
 accelerate>=0.28.0        # image generation
+trafilatura>=1.10         # /api/fetch and /api/search page text extraction
