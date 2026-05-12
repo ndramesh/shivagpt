@@ -376,6 +376,94 @@ and nothing else. There are no order-submission endpoints anywhere on
 this server. Requires `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` in
 the systemd unit (same keys used by `/stock`).
 
+## ThinkOrSwim / Schwab (`/tp`)
+
+`/tp` shows your Schwab/ThinkOrSwim account balances and positions
+(read-only). Schwab acquired TD Ameritrade in 2020, so the
+ThinkOrSwim account you log into is now a Schwab account — same
+positions, same money, accessed via the Schwab Developer API.
+
+### One-time setup
+
+The Schwab API uses OAuth2, which is fiddlier than a static API key.
+You only do this once.
+
+**1. Register a developer app** at
+[developer.schwab.com](https://developer.schwab.com):
+
+- Create a free personal account (use the same login as your trading
+  account).
+- Dashboard → API Products → **enable both**: "Accounts and Trading
+  Production" and "Market Data Production" (both free).
+- Dashboard → Add a New App. Fields:
+    - **App Name**: anything (e.g. `shivagpt-personal`)
+    - **Callback URL**: `https://127.0.0.1` (exactly that, no port)
+    - **API Product**: select both products from above
+- Submit. Schwab reviews new apps; **approval usually arrives within
+  a day**, often hours. You can't authenticate until it shows
+  "Approved." (You'll get an email.)
+- Once approved, open the app and copy "App Key" and "App Secret."
+
+**2. Set the credentials** in the systemd unit:
+
+```bash
+ssh kailash 'sudo systemctl edit shivagpt'
+# add:
+[Service]
+Environment=SCHWAB_APP_KEY=your_app_key_here
+Environment=SCHWAB_APP_SECRET=your_app_secret_here
+# save, then:
+ssh kailash 'sudo systemctl restart shivagpt'
+```
+
+**3. Run the one-time OAuth flow.** This generates the token file
+that the server uses thereafter. Easiest is on your Mac (browser
+available):
+
+```bash
+cd ~/src/shivagpt
+export SCHWAB_APP_KEY=your_app_key_here
+export SCHWAB_APP_SECRET=your_app_secret_here
+./scripts/schwab_auth.py --token-path data/schwab-token.json
+```
+
+A browser tab opens to the Schwab login page. Log in, allow access,
+and the script captures the redirect automatically. When it prints
+"OK — Schwab returned N account(s)," copy the token to kailash:
+
+```bash
+scp data/schwab-token.json kailash:~/shivagpt/data/schwab-token.json
+ssh kailash 'sudo systemctl restart shivagpt'
+```
+
+If you'd rather do everything on kailash (no Mac browser), use the
+manual flow — the script prints an auth URL, you open it in any
+browser, log in, and paste the redirected URL back:
+
+```bash
+ssh kailash 'cd ~/shivagpt && \
+  SCHWAB_APP_KEY=... SCHWAB_APP_SECRET=... \
+  .venv/bin/python scripts/schwab_auth.py --manual'
+```
+
+**4. Try it.** Open Safari at `http://kailash:8000`, hard reload,
+and type `/tp`. You should see your account balances and positions.
+
+### Token lifetime
+
+Schwab's OAuth refresh tokens last **7 days**. The server refreshes
+the access token automatically on every API call (so you can use
+`/tp` continuously for a week without re-auth). If you go more than
+7 days between uses, the refresh token expires and you need to re-run
+`scripts/schwab_auth.py` to mint a new one. The script overwrites
+the existing token file in place — no other changes needed.
+
+### What it can't do
+
+Place trades. The server only calls Schwab's `get_account_numbers()`
+and `get_account(..., fields=POSITIONS)`. There are no order
+endpoints wired anywhere on this server.
+
 ## Regenerate keeps branches
 
 Hit **Regenerate** on an assistant message and the previous response

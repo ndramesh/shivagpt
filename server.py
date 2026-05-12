@@ -1733,6 +1733,170 @@ async def portfolio(req: Request) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# ThinkOrSwim / Schwab portfolio (/api/tp)
+#
+# Schwab acquired TD Ameritrade in 2020, so the ThinkOrSwim account is now a
+# Schwab account, accessed through the Schwab Developer API (OAuth2). Setup
+# requires a one-time browser-based auth flow — see scripts/schwab_auth.py.
+#
+# READ-ONLY by construction: we only call get_account_numbers() and
+# get_account(..., fields=POSITIONS). No order endpoints touched anywhere.
+# ---------------------------------------------------------------------------
+
+SCHWAB_TOKEN_PATH = os.getenv("SCHWAB_TOKEN_PATH", str(DATA_DIR / "schwab-token.json"))
+
+
+def _schwab_client():
+    """Return a ready-to-use Schwab client if credentials + token are present.
+
+    Returns None (rather than raising) when not configured, so /api/tp can
+    surface a helpful "needs setup" message instead of a 500.
+    """
+    key = (os.getenv("SCHWAB_APP_KEY") or os.getenv("SCHWAB_API_KEY") or "").strip()
+    secret = (os.getenv("SCHWAB_APP_SECRET") or os.getenv("SCHWAB_API_SECRET") or "").strip()
+    if not key or not secret:
+        return None
+    if not Path(SCHWAB_TOKEN_PATH).exists():
+        log.warning("Schwab token file not found at %s — run scripts/schwab_auth.py once",
+                    SCHWAB_TOKEN_PATH)
+        return None
+    try:
+        from schwab.auth import client_from_token_file
+    except ImportError as e:
+        log.warning("schwab-py not installed: %s", e)
+        return None
+    try:
+        return client_from_token_file(
+            token_path=SCHWAB_TOKEN_PATH,
+            api_key=key,
+            app_secret=secret,
+        )
+    except Exception as e:
+        log.warning("Schwab client init failed (refresh token may be expired): %s", e)
+        return None
+
+
+def _format_schwab_position(p: dict) -> dict[str, Any]:
+    instrument = p.get("instrument", {}) or {}
+    long_qty = float(p.get("longQuantity") or 0)
+    short_qty = float(p.get("shortQuantity") or 0)
+    qty = long_qty - short_qty
+    return {
+        "symbol": instrument.get("symbol"),
+        "asset_type": instrument.get("assetType"),
+        "description": instrument.get("description"),
+        "qty": qty,
+        "side": "long" if long_qty > 0 else ("short" if short_qty > 0 else "flat"),
+        "avg_price": p.get("averagePrice"),
+        "market_value": p.get("marketValue"),
+        "current_day_pl": p.get("currentDayProfitLoss"),
+        "current_day_pl_pct": p.get("currentDayProfitLossPercentage"),
+        "long_open_pl": p.get("longOpenProfitLoss"),
+        "short_open_pl": p.get("shortOpenProfitLoss"),
+        "settled_long_qty": p.get("settledLongQuantity"),
+        "settled_short_qty": p.get("settledShortQuantity"),
+    }
+
+
+@app.post("/api/tp")
+async def tp_portfolio(req: Request) -> dict[str, Any]:
+    """Return Schwab/ThinkOrSwim account balances + positions. READ-ONLY.
+
+    Only call sites: schwab-py's get_account_numbers() and
+    get_account(account_hash, fields=POSITIONS). No order endpoints.
+    """
+    c = _schwab_client()
+    if c is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Schwab not configured. Steps: (1) register an app at "
+                   "developer.schwab.com, (2) set SCHWAB_APP_KEY + "
+                   "SCHWAB_APP_SECRET in the systemd unit, "
+                   "(3) run scripts/schwab_auth.py once to populate "
+                   f"the token file at {SCHWAB_TOKEN_PATH}.",
+        )
+
+    def _do() -> dict[str, Any]:
+        from schwab.client import Client
+        try:
+            acc_numbers_resp = c.get_account_numbers()
+            if acc_numbers_resp.status_code != 200:
+                raise HTTPException(
+                    status_code=502,
+                    detail=f"Schwab API returned {acc_numbers_resp.status_code}: "
+                           f"{acc_numbers_resp.text[:200]}",
+                )
+            acc_entries = acc_numbers_resp.json() or []
+        except HTTPException:
+            raise
+        except Exception as e:
+            raise HTTPException(status_code=502, detail=f"Schwab error fetching account list: {e}")
+
+        accounts: list[dict] = []
+        for entry in acc_entries:
+            hash_value = entry.get("hashValue") or entry.get("accountHash")
+            account_num = entry.get("accountNumber")
+            if not hash_value:
+                continue
+            try:
+                # schwab-py exposes the fields enum on the Client class
+                pos_resp = c.get_account(hash_value, fields=Client.Account.Fields.POSITIONS)
+                if pos_resp.status_code != 200:
+                    log.warning("Schwab get_account(%s) returned %d: %s",
+                                account_num, pos_resp.status_code, pos_resp.text[:200])
+                    continue
+                pos_data = pos_resp.json() or {}
+            except Exception as e:
+                log.warning("Schwab get_account(%s) failed: %s", account_num, e)
+                continue
+
+            sec_acc = pos_data.get("securitiesAccount", {}) or {}
+            balances = sec_acc.get("currentBalances", {}) or {}
+            initial_balances = sec_acc.get("initialBalances", {}) or {}
+            positions = sec_acc.get("positions", []) or []
+
+            # Some balance fields differ between cash and margin accounts; we
+            # surface the common ones and skip ones that aren't present.
+            def _g(name):
+                return balances.get(name)
+
+            accounts.append({
+                "account_number": account_num,
+                "account_hash": hash_value,
+                "type": sec_acc.get("type"),
+                "is_day_trader": sec_acc.get("isDayTrader", False),
+                "round_trips": sec_acc.get("roundTrips", 0),
+                "balances": {
+                    "cash": _g("cashBalance"),
+                    "equity": _g("equity"),
+                    "liquidation_value": _g("liquidationValue"),
+                    "buying_power": _g("buyingPower"),
+                    "buying_power_non_margin": _g("buyingPowerNonMarginableTrade"),
+                    "long_market_value": _g("longMarketValue"),
+                    "short_market_value": _g("shortMarketValue"),
+                    "available_funds": _g("availableFunds"),
+                    "day_trading_buying_power": _g("dayTradingBuyingPower"),
+                    "starting_equity": initial_balances.get("equity"),
+                },
+                "positions": [_format_schwab_position(p) for p in positions],
+            })
+
+        if not accounts:
+            return {
+                "accounts": [],
+                "note": "No accounts returned from Schwab (token may be expired — re-run scripts/schwab_auth.py)",
+                "disclaimer": STOCK_DISCLAIMER,
+            }
+
+        return {"accounts": accounts, "disclaimer": STOCK_DISCLAIMER}
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_do), timeout=30)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=504, detail="Schwab portfolio fetch timed out")
+
+
+# ---------------------------------------------------------------------------
 # Voice input (/api/transcribe) — faster-whisper STT
 # ---------------------------------------------------------------------------
 

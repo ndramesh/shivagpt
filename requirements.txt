@@ -14,3 +14,4 @@ alpaca-py>=0.30           # primary stock data: real-time quotes, bars, options
 pandas>=2.0               # used by /api/stock/* for indicator computation
 faster-whisper>=1.0       # /api/transcribe (voice in, CPU int8)
 piper-tts>=1.2            # /api/tts (voice out)
+schwab-py>=1.4            # /api/tp Schwab/ThinkOrSwim portfolio (OAuth2)

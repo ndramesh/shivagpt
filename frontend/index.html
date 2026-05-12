@@ -2108,6 +2108,7 @@
         { name: '/fetch', desc: 'Fetch a URL and answer questions about it', hasArgs: true, hint: '<url> [question]' },
         { name: '/stock', desc: 'Stock quote + technicals + analyst consensus (real-time via Alpaca)', hasArgs: true, hint: '<ticker> [options|news]' },
         { name: '/portfolio', desc: 'Your Alpaca account: balances + open positions (read-only)', hasArgs: false },
+        { name: '/tp', desc: 'Your Schwab / ThinkOrSwim account: balances + positions (read-only)', hasArgs: false },
       ];
 
       const BUILT_IN_PRESETS = [
@@ -4229,6 +4230,59 @@
             break;
           }
 
+          case '/tp': {
+            if (!c) c = newConvo();
+            c.messages.push({ role: 'user', content: '/tp', ts: Date.now() });
+            autoTitleFromFirstUserMsg(c);
+            c.updatedAt = Date.now();
+            persistAll();
+            renderSidebar();
+            renderActive();
+
+            const loadingMsg = {
+              role: 'system',
+              content: '*Fetching your Schwab / ThinkOrSwim portfolio…*',
+              ts: Date.now(),
+            };
+            c.messages.push(loadingMsg);
+            persistAll();
+            renderActive();
+            scrollToBottom();
+
+            try {
+              const r = await fetch(apiUrl('/api/tp'), {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: '{}',
+              });
+              if (!r.ok) {
+                let detail = '';
+                try { const j = await r.json(); detail = j.detail || JSON.stringify(j); }
+                catch { detail = await r.text(); }
+                throw new Error(detail || ('HTTP ' + r.status));
+              }
+              const data = await r.json();
+              const md = renderTpReport(data);
+              const i = c.messages.indexOf(loadingMsg);
+              if (i >= 0) {
+                c.messages[i].content = md;
+                persistAll();
+                renderActive();
+                scrollToBottom();
+              }
+            } catch (e) {
+              console.error(e);
+              const i = c.messages.indexOf(loadingMsg);
+              if (i >= 0) {
+                c.messages[i].content = `*Failed to fetch Schwab portfolio: ${e.message}*\n\n_If this is the first time, you may need to set up Schwab API credentials. See README → "ThinkOrSwim / Schwab setup"._`;
+                persistAll();
+                renderActive();
+              }
+              toast('Schwab portfolio fetch failed');
+            }
+            break;
+          }
+
           case '/portfolio': {
             if (!c) c = newConvo();
             c.messages.push({ role: 'user', content: '/portfolio', ts: Date.now() });
@@ -4362,6 +4416,67 @@
       // Render a stock dashboard as a single markdown blob. Kept inline as
       // markdown (not custom DOM) so it works with our existing assignContent
       // pipeline and re-renders cleanly when the message list does.
+      // Render the Schwab /api/tp response. Shape is one-or-more accounts,
+      // each with its own balances + positions block. Positions roll up
+      // long+short and show side, day P&L, and open P&L per leg.
+      function renderTpReport(data) {
+        const accounts = data.accounts || [];
+        if (!accounts.length) {
+          return `## Schwab / ThinkOrSwim\n\n*${data.note || 'No accounts returned.'}*\n\n${data.disclaimer || ''}`;
+        }
+        const fm = v => v == null ? 'n/a' : '$' + Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
+        const fp = v => v == null ? 'n/a' : (v >= 0 ? '+' : '') + Number(v).toFixed(2) + '%';
+
+        let md = `## Schwab / ThinkOrSwim\n\n`;
+        for (const a of accounts) {
+          const b = a.balances || {};
+          const acctMask = a.account_number
+            ? '****' + String(a.account_number).slice(-4)
+            : a.account_hash?.slice(0, 8) || '?';
+          md += `### Account ${acctMask} · ${a.type || 'account'}${a.is_day_trader ? ' · PDT' : ''}\n\n`;
+          md += `**${fm(b.liquidation_value)}** liquidation value\n\n`;
+          md += `| | |\n|---|---|\n`;
+          md += `| Cash | ${fm(b.cash)} |\n`;
+          if (b.equity != null)                 md += `| Equity | ${fm(b.equity)} |\n`;
+          if (b.long_market_value != null)      md += `| Long market value | ${fm(b.long_market_value)} |\n`;
+          if (b.short_market_value != null && b.short_market_value !== 0)
+                                                 md += `| Short market value | ${fm(b.short_market_value)} |\n`;
+          if (b.buying_power != null)           md += `| Buying power | ${fm(b.buying_power)} |\n`;
+          if (b.day_trading_buying_power != null)
+                                                 md += `| Day-trading BP | ${fm(b.day_trading_buying_power)} |\n`;
+          if (b.available_funds != null)        md += `| Available funds | ${fm(b.available_funds)} |\n`;
+          if (a.round_trips != null)            md += `| Round trips | ${a.round_trips} |\n`;
+          md += '\n';
+
+          const pos = a.positions || [];
+          if (pos.length) {
+            md += `**Positions (${pos.length})**\n\n`;
+            md += `| Symbol | Side | Qty | Avg | Mkt Value | Day P&L | Open P&L |\n`;
+            md += `|---|---|---:|---:|---:|---:|---:|\n`;
+            // Sort by abs(market value) desc so the biggest is on top
+            pos.sort((x, y) => Math.abs((y.market_value || 0)) - Math.abs((x.market_value || 0)));
+            for (const p of pos) {
+              const dpl = p.current_day_pl;
+              const dplPct = p.current_day_pl_pct;
+              const open = (p.side === 'long' ? p.long_open_pl : p.short_open_pl);
+              const desc = p.description ? ` *${p.description.slice(0, 40)}*` : '';
+              const sym = `**${p.symbol || '?'}**${p.asset_type && p.asset_type !== 'EQUITY' ? ' *(' + p.asset_type + ')*' : ''}`;
+              const dplStr = dpl != null
+                ? `${dpl >= 0 ? '+' : ''}${fm(dpl)}${dplPct != null ? ` (${fp(dplPct)})` : ''}`
+                : 'n/a';
+              md += `| ${sym} | ${p.side || '-'} | ${p.qty} | ${fm(p.avg_price)} | ${fm(p.market_value)} | ${dplStr} | ${open != null ? (open >= 0 ? '+' : '') + fm(open) : 'n/a'} |\n`;
+            }
+            md += '\n';
+            md += `Tip: \`/stock ${pos[0].symbol}\` for a deep dive on the biggest position.\n\n`;
+          } else {
+            md += `*No open positions in this account.*\n\n`;
+          }
+        }
+        md += `---\n\n`;
+        md += data.disclaimer || '';
+        return md;
+      }
+
       function renderPortfolioReport(data) {
         const a = data.account || {};
         const positions = data.positions || [];

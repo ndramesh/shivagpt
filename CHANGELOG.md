@@ -5,6 +5,19 @@ All notable changes to ShivaGPT are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`/tp` — ThinkOrSwim / Schwab portfolio (read-only).** New endpoint
+  `POST /api/tp` reads your Schwab account (ToS got folded into Schwab
+  in 2020) via the official Schwab Developer API. Returns balances
+  (cash, equity, liquidation value, buying power, day-trading BP) and
+  positions (symbol, side, qty, avg price, mkt value, day P&L, open
+  P&L) for every linked account. Strictly read-only — only
+  `get_account_numbers()` and `get_account(..., fields=POSITIONS)` are
+  called. Frontend `/tp` slash command renders a per-account
+  dashboard. Requires a one-time OAuth setup
+  (`scripts/schwab_auth.py`) and `SCHWAB_APP_KEY` + `SCHWAB_APP_SECRET`
+  env vars; README has the full walkthrough.
+
+### Added
 - **Voice input via faster-whisper.** A mic button in the composer
   records audio (MediaRecorder → webm/opus), posts it to a new
   `POST /api/transcribe` endpoint, which runs `faster-whisper`
