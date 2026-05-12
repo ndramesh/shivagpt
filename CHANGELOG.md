@@ -4,6 +4,35 @@ All notable changes to ShivaGPT are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **`/imgen`: aspect ratio accepts `WxH` or `W:H`.** Earlier the parser
+  only honored `:` and silently fell back to a square when given `x` —
+  fixed so both work, with whitespace tolerated.
+- **`/imgen`: community SDXL fine-tunes added.** Vanilla SDXL Base and
+  FLUX-schnell produce generic-stylized faces. Two ungated fine-tunes
+  are now in the model registry, dramatically better at photorealistic
+  faces, anatomy, and hands:
+    - `realvis-xl` (aliases: `realvis`, `real`, `realistic`) —
+      `SG161222/RealVisXL_V5.0`, currently the strongest free realism
+      fine-tune. Best for portraits and people.
+    - `juggernaut-xl` (aliases: `juggernaut`, `jug`) —
+      `RunDiffusion/Juggernaut-XL-v9`, great general-purpose realism
+      and composition.
+  Both auto-download via diffusers on first use (~6.5 GB each).
+
+### Changed
+- **`/imgen` rebuilt around FLUX + an upscale chain.** SDXL Base is now
+  the legacy fallback; the new default is `flux-schnell` (Apache 2.0,
+  4-step, ~2–4 s at 1024 on Blackwell). `flux-dev` is available for
+  best quality (gated on HF — set `HF_TOKEN`). SDXL still works via
+  `-model sdxl`. New flags: `-size N` (square) or `-size WxH`,
+  `-aspect 16:9`, `-upscale N` (chains Upscayl/remacri 2×/4× passes,
+  capped at 16× for a ~16K final), `-steps`, `-seed`, `-guidance`.
+  The endpoint returns native + final dimensions and per-phase timing.
+  Env knobs: `IMGEN_DEFAULT_MODEL`, `IMGEN_MAX_OUTPUT_SIDE` (default
+  16384), `IMGEN_TIMEOUT_S`. New `GET /api/imgen/models` lists what's
+  available with their per-model max native side and default steps.
+
 ### Added
 - **DeepSeek-R1 / QwQ-style `<think>` block UI** — reasoning models that
   emit a `<think>…</think>` block before the answer now render that block

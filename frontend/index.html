@@ -2043,7 +2043,7 @@
         { name: '/login', desc: 'Open admin login', hasArgs: false },
         { name: '/logout', desc: 'Log out admin session', hasArgs: false },
         { name: '/debug', desc: 'Show system debug info', hasArgs: false },
-        { name: '/imgen', desc: 'Generate an image', hasArgs: true, hint: '<description>' },
+        { name: '/imgen', desc: 'Generate image — use -model realvis for realistic faces, -upscale 4 for ~4K', hasArgs: true, hint: '[-model realvis|flux-dev|jug] [-size N] [-aspect W:H] [-upscale X] <prompt>' },
         { name: '/codereview', desc: 'Review code from a URL, ssh path, or local folder', hasArgs: true, hint: '[-model X] <path>' },
         { name: '/search', desc: 'Web search (SearXNG) + cited answer', hasArgs: true, hint: '[-model X] <query>' },
         { name: '/fetch', desc: 'Fetch a URL and answer questions about it', hasArgs: true, hint: '<url> [question]' },
@@ -3619,34 +3619,102 @@
             }
             break;
             
-          case '/imgen':
-            if (!args) { toast('Please provide a description'); break; }
+          case '/imgen': {
+            if (!args) {
+              toast('Usage: /imgen [-model flux-schnell|flux-dev|sdxl] [-size 2048|1920x1080] [-aspect 16:9] [-upscale 4] [-steps 20] [-seed N] <prompt>');
+              break;
+            }
+            // Flag parser: consume leading `-flag value` pairs, remainder is the prompt.
+            // Recognised flags map to the /api/imgen request body fields.
+            const FLAG_KEYS = {
+              'm': 'model', 'model': 'model',
+              'size': 'size', 's': 'size',
+              'w': 'width', 'width': 'width',
+              'h': 'height', 'height': 'height',
+              'aspect': 'aspect', 'ar': 'aspect',
+              'upscale': 'upscale', 'u': 'upscale',
+              'steps': 'steps',
+              'seed': 'seed',
+              'guidance': 'guidance', 'cfg': 'guidance',
+            };
+            const reqBody = { prompt: '' };
+            let rest = args.trim();
+            while (true) {
+              const m = rest.match(/^-([a-zA-Z]+)\s+(\S+)\s*(.*)$/);
+              if (!m) break;
+              const flagName = FLAG_KEYS[m[1].toLowerCase()];
+              if (!flagName) break;   // unknown flag — treat as start of prompt
+              const val = m[2];
+              if (flagName === 'size' && /^\d+x\d+$/i.test(val)) {
+                const [w, h] = val.toLowerCase().split('x');
+                reqBody.width = parseInt(w, 10);
+                reqBody.height = parseInt(h, 10);
+              } else if (['size', 'width', 'height', 'upscale', 'steps', 'seed'].includes(flagName)) {
+                reqBody[flagName] = parseInt(val, 10);
+              } else if (flagName === 'guidance') {
+                reqBody.guidance = parseFloat(val);
+              } else {
+                reqBody[flagName] = val;
+              }
+              rest = m[3];
+            }
+            reqBody.prompt = rest.trim();
+            if (!reqBody.prompt) { toast('Missing <prompt> after flags'); break; }
             if (!c) c = newConvo();
-            
-            // Add a temporary loading message
-            const loadingMsg = { role: 'system', content: `*Generating image for: "${args}"...*`, ts: Date.now() };
+
+            // Echo the command + a description of what we asked for
+            const sizeDesc = reqBody.width && reqBody.height
+              ? `${reqBody.width}×${reqBody.height}`
+              : (reqBody.size ? `${reqBody.size}px` : '1024px');
+            const upDesc = reqBody.upscale && reqBody.upscale > 1
+              ? ` → ${reqBody.upscale}× upscale (~${reqBody.upscale * (reqBody.size || reqBody.width || 1024)}px)`
+              : '';
+            const modelDesc = reqBody.model || 'default';
+
+            c.messages.push({ role: 'user', content: `/imgen ${args}`, ts: Date.now() });
+            autoTitleFromFirstUserMsg(c);
+            c.updatedAt = Date.now();
+            persistAll();
+            renderSidebar();
+            renderActive();
+
+            const loadingMsg = {
+              role: 'system',
+              content: `*Generating ${sizeDesc}${upDesc} image with \`${modelDesc}\`…*`,
+              ts: Date.now(),
+            };
             c.messages.push(loadingMsg);
             persistAll();
             renderActive();
             scrollToBottom();
-            
+
             $('sendBtn').disabled = true;
             try {
               const r = await fetch(apiUrl('/api/imgen'), {
                 method: 'POST',
                 headers: { 'content-type': 'application/json' },
-                body: JSON.stringify({ prompt: args })
+                body: JSON.stringify(reqBody),
               });
               if (!r.ok) {
-                const err = await r.text();
-                throw new Error(err);
+                let detail = '';
+                try { const j = await r.json(); detail = j.detail || JSON.stringify(j); }
+                catch { detail = await r.text(); }
+                throw new Error(`Server returned ${r.status}: ${(detail || '').slice(0, 300)}`);
               }
               const data = await r.json();
-              
-              // Replace loading message with the actual image
+
+              // Replace loading message with the actual image + a stats line
               const i = c.messages.indexOf(loadingMsg);
               if (i >= 0) {
-                c.messages[i].content = `**Generated Image:** "${args}"`;
+                const sizeNote = (data.upscale && data.upscale > 1)
+                  ? `${data.native_width}×${data.native_height} → **${data.width}×${data.height}** (${data.upscale}× upscale)`
+                  : `**${data.width}×${data.height}**`;
+                const timing = (data.upscale_seconds > 0)
+                  ? `gen ${data.gen_seconds}s · upscale ${data.upscale_seconds}s`
+                  : `${data.gen_seconds}s`;
+                const sizeMb = (data.size / 1024 / 1024).toFixed(1);
+                c.messages[i].content =
+                  `**${reqBody.prompt}**\n\n${sizeNote} · ${timing} · ${sizeMb} MB · \`${data.model}\``;
                 c.messages[i].generatedImage = { mime: data.mime, base64: data.image };
                 persistAll();
                 renderActive();
@@ -3665,6 +3733,7 @@
               $('sendBtn').disabled = false;
             }
             break;
+          }
 
           case '/codereview': {
             if (!args) {

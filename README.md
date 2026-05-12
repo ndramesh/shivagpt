@@ -226,6 +226,57 @@ project notes). Env vars on the ShivaGPT server side:
 
 Like `/codereview`, both endpoints require an admin login (`/login`).
 
+## Image generation (`/imgen`)
+
+`/imgen` produces images via FLUX or SDXL on the DGX, with an optional
+AI-upscale chain (Upscayl/remacri) for reaching HD/4K/8K/16K outputs:
+
+```
+/imgen a koi pond in late afternoon light
+/imgen -size 2048 -aspect 16:9 cinematic mountain sunrise
+/imgen -upscale 4 -size 2048 modernist house in a redwood grove   # → 8K
+/imgen -model flux-dev -steps 25 -size 1536 close-up of a hummingbird
+/imgen -model sdxl -seed 12345 a watercolor coffee shop interior
+```
+
+Flags (all optional, any order, then prompt at the end):
+
+- `-model <name>` — supported models, listed in rough quality order
+  for realistic content:
+    - `realvis-xl` (aliases: `realvis`, `real`, `realistic`) —
+      community SDXL fine-tune by SG161222. **Best free option for
+      photorealistic faces and people.** Ungated.
+    - `juggernaut-xl` (alias: `jug`) — another community SDXL fine-tune,
+      great general-purpose realism. Ungated.
+    - `flux-dev` — Black Forest Labs FLUX.1-dev, gated on HF (needs
+      `HF_TOKEN`). Excellent prompt adherence, slightly stylized look.
+    - `flux-schnell` (alias: `schnell`, default) — fast 4-step FLUX,
+      Apache 2.0, ungated. Good for quick iteration, weaker on faces.
+    - `sdxl` — legacy SDXL Base, kept for compatibility. Use one of the
+      community fine-tunes above instead.
+- `-size N` — square N×N. Or `-size WxH` for explicit aspect.
+- `-aspect W:H` — used with `-size N` to derive non-square.
+- `-upscale N` — chain Upscayl 2× / 4× passes after generation to
+  reach N× the native side (capped at 16, so 2048 native + 8× = 16K).
+- `-steps N` — diffusion steps (defaults: schnell 4, dev 20, sdxl 25).
+- `-guidance N` — CFG scale (no effect on schnell, which is distilled).
+- `-seed N` — reproducibility.
+
+The model is sized to native at the GPU's sweet spot (FLUX up to 2048,
+SDXL up to 1536), then upscaled in 2× or 4× passes by Upscayl. Past
+~8K the upscaler is doing most of the work — useful for prints, less so
+for visible-on-screen detail.
+
+Env knobs:
+
+- `IMGEN_DEFAULT_MODEL` — default `flux-schnell`.
+- `IMGEN_MAX_OUTPUT_SIDE` — final-image side cap, default `16384`.
+- `IMGEN_TIMEOUT_S` — per-call timeout, default 600 s.
+- `HF_TOKEN` — required for FLUX.1-dev (gated repo on Hugging Face).
+
+`GET /api/imgen/models` returns the registry with per-model `max_native`
+and `default_steps`, for building a UI picker.
+
 ## Streaming behavior
 
 Tokens append as they arrive. If the first token takes more than 4.5

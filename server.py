@@ -67,8 +67,6 @@ STATE_FILE = DATA_DIR / "state.json"
 ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "ndr123")
 ADMIN_TOKENS: set[str] = set()
 
-# Global for diffusers lazy-loading
-_imgen_pipeline = None
 
 app = FastAPI(title="ShivaGPT", version="1.0.0")
 
@@ -471,28 +469,29 @@ def _process_image(img_bytes: bytes, operation: str, params: dict) -> tuple[byte
     if operation == "upscale":
         upscayl_bin = DATA_DIR / "upscayl" / "resources" / "bin" / "upscayl-bin"
         models_dir = DATA_DIR / "upscayl" / "resources" / "models"
-        
+
         if upscayl_bin.exists() and models_dir.exists():
-            log.info("Using Upscayl for AI upscaling...")
+            # remacri supports 2x, 3x, 4x per pass. The caller passes "factor".
+            requested = int(params.get("factor", 4))
+            scale = max(2, min(requested, 4))
+            log.info("Using Upscayl for AI upscaling (%dx)...", scale)
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f_in, \
                  tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f_out:
-                
                 img.save(f_in.name, format="PNG")
-                
                 cmd = [
                     str(upscayl_bin),
                     "-i", f_in.name,
                     "-o", f_out.name,
-                    "-s", "2",
+                    "-s", str(scale),
                     "-m", str(models_dir),
-                    "-n", "remacri"
+                    "-n", "remacri",
                 ]
                 try:
                     subprocess.run(cmd, check=True, capture_output=True)
                     img = Image.open(f_out.name)
                     img.load()
                 except subprocess.CalledProcessError as e:
-                    log.error(f"Upscayl failed: {e.stderr.decode()}")
+                    log.error("Upscayl failed: %s", e.stderr.decode() if e.stderr else e)
                     raise ValueError("AI Upscaling failed")
                 finally:
                     try:
@@ -653,24 +652,195 @@ async def process_image(req: Request) -> dict[str, Any]:
 
 # ---------------------------------------------------------------------------
 # Image Generation (/api/imgen)
+#
+# Supports multiple backends so you can pick speed vs quality vs license:
+#   flux-schnell  — Apache 2.0, 4 steps, very fast, default
+#   flux-dev      — best quality, gated on HF (needs HF_TOKEN), 20+ steps
+#   sdxl          — legacy fallback
+#
+# Native resolution is capped at ~2048×2048 (beyond that, models degrade).
+# To reach 4K / 8K / 16K, the endpoint chains the existing Upscayl pipeline
+# (2× or 4× per pass, remacri model) on top of the diffusion output.
 # ---------------------------------------------------------------------------
 
-def _get_imgen_pipeline():
-    global _imgen_pipeline
-    if _imgen_pipeline is None:
-        log.info("Loading diffusers pipeline (this will take a while)...")
-        import torch
+# Model registry. "load" is called once per model to construct a diffusers
+# pipeline; the result is cached in _imgen_state.
+IMGEN_MODELS: dict[str, dict[str, Any]] = {
+    "flux-schnell": {
+        "hf": "black-forest-labs/FLUX.1-schnell",
+        "default_steps": 4,
+        "default_guidance": 0.0,   # schnell is distilled, doesn't use CFG
+        "use_cfg": False,
+        "max_native": 2048,
+        "pipeline_class": "FluxPipeline",
+        "dtype": "bfloat16",
+        "load_kwargs": {},
+    },
+    "flux-dev": {
+        "hf": "black-forest-labs/FLUX.1-dev",
+        "default_steps": 20,
+        "default_guidance": 3.5,
+        "use_cfg": True,
+        "max_native": 2048,
+        "pipeline_class": "FluxPipeline",
+        "dtype": "bfloat16",
+        "load_kwargs": {},
+    },
+    "sdxl": {
+        "hf": "stabilityai/stable-diffusion-xl-base-1.0",
+        "default_steps": 25,
+        "default_guidance": 7.5,
+        "use_cfg": True,
+        "max_native": 1536,
+        "pipeline_class": "AutoPipelineForText2Image",
+        "dtype": "float16",
+        "load_kwargs": {"variant": "fp16", "use_safetensors": True},
+    },
+    # Community fine-tunes of SDXL. These are dramatically better at
+    # photorealistic faces, anatomy, and hands than vanilla SDXL Base. Both
+    # are ungated on Hugging Face. ~6.5 GB each on first download.
+    "realvis-xl": {
+        "hf": "SG161222/RealVisXL_V5.0",
+        "default_steps": 30,
+        "default_guidance": 6.0,
+        "use_cfg": True,
+        "max_native": 1536,
+        "pipeline_class": "AutoPipelineForText2Image",
+        "dtype": "float16",
+        "load_kwargs": {"use_safetensors": True},
+    },
+    "juggernaut-xl": {
+        "hf": "RunDiffusion/Juggernaut-XL-v9",
+        "default_steps": 30,
+        "default_guidance": 6.5,
+        "use_cfg": True,
+        "max_native": 1536,
+        "pipeline_class": "AutoPipelineForText2Image",
+        "dtype": "float16",
+        "load_kwargs": {"use_safetensors": True},
+    },
+}
+
+# Friendly aliases so the user doesn't have to remember exact tags.
+IMGEN_ALIASES: dict[str, str] = {
+    "flux": "flux-schnell",
+    "schnell": "flux-schnell",
+    "dev": "flux-dev",
+    "realvis": "realvis-xl",
+    "realistic": "realvis-xl",
+    "real": "realvis-xl",
+    "juggernaut": "juggernaut-xl",
+    "jug": "juggernaut-xl",
+}
+
+IMGEN_DEFAULT_MODEL = os.getenv("IMGEN_DEFAULT_MODEL", "flux-schnell")
+IMGEN_MAX_OUTPUT_SIDE = int(os.getenv("IMGEN_MAX_OUTPUT_SIDE", "16384"))  # final-image side cap
+IMGEN_TIMEOUT_S = float(os.getenv("IMGEN_TIMEOUT_S", "600"))
+
+# Singleton pipeline cache. Only one model is kept resident at a time
+# (each is ~10-25 GB VRAM; the DGX has plenty but no need to thrash).
+_imgen_state: dict[str, Any] = {"model_key": None, "pipeline": None}
+
+
+def _get_imgen_pipeline(model_key: str):
+    """Lazy-load and cache the requested diffusers pipeline. Swaps if needed."""
+    if _imgen_state["model_key"] == model_key and _imgen_state["pipeline"] is not None:
+        return _imgen_state["pipeline"]
+
+    import torch
+    # Free the previous pipeline first so we don't double up on VRAM.
+    if _imgen_state["pipeline"] is not None:
+        log.info("imgen: unloading %s to make room for %s",
+                 _imgen_state["model_key"], model_key)
+        _imgen_state["pipeline"] = None
+        torch.cuda.empty_cache()
+
+    cfg = IMGEN_MODELS[model_key]
+    log.info("imgen: loading %s (%s) ...", model_key, cfg["hf"])
+    dtype = getattr(torch, cfg["dtype"])
+    if cfg["pipeline_class"] == "FluxPipeline":
+        from diffusers import FluxPipeline
+        pipe = FluxPipeline.from_pretrained(cfg["hf"], torch_dtype=dtype, **cfg["load_kwargs"])
+    else:
         from diffusers import AutoPipelineForText2Image
-        # Full SDXL Base 1.0 for high quality
-        _imgen_pipeline = AutoPipelineForText2Image.from_pretrained(
-            "stabilityai/stable-diffusion-xl-base-1.0",
-            torch_dtype=torch.float16,
-            variant="fp16",
-            use_safetensors=True
-        )
-        _imgen_pipeline = _imgen_pipeline.to("cuda")
-        log.info("Pipeline loaded.")
-    return _imgen_pipeline
+        pipe = AutoPipelineForText2Image.from_pretrained(cfg["hf"], torch_dtype=dtype, **cfg["load_kwargs"])
+    pipe = pipe.to("cuda")
+    _imgen_state["model_key"] = model_key
+    _imgen_state["pipeline"] = pipe
+    log.info("imgen: %s loaded", model_key)
+    return pipe
+
+
+def _parse_imgen_size(body: dict, cfg: dict) -> tuple[int, int]:
+    """Resolve requested {width, height, size, aspect} to a concrete WxH.
+
+    `size` alone -> square. `aspect` (e.g. "16:9") + `size` -> wide.
+    """
+    max_native = cfg["max_native"]
+    width = body.get("width")
+    height = body.get("height")
+    size = body.get("size")
+    aspect = (body.get("aspect") or "").strip()
+
+    if not width and not height and size:
+        # Accept "W:H" or "WxH" (and tolerate spaces) for the aspect ratio.
+        sep = ":" if ":" in aspect else ("x" if "x" in aspect.lower() else None)
+        if sep:
+            try:
+                ar_w, ar_h = (float(p.strip()) for p in aspect.lower().split(sep, 1))
+            except ValueError:
+                ar_w, ar_h = 1.0, 1.0
+            if ar_w >= ar_h:
+                width = int(size)
+                height = int(size * ar_h / ar_w)
+            else:
+                height = int(size)
+                width = int(size * ar_w / ar_h)
+        else:
+            width = height = int(size)
+
+    width = int(width or 1024)
+    height = int(height or 1024)
+    width = max(256, min(width, max_native))
+    height = max(256, min(height, max_native))
+
+    # FLUX needs side lengths that are multiples of 16; SDXL needs 8.
+    align = 16 if cfg["pipeline_class"] == "FluxPipeline" else 8
+    width = (width // align) * align
+    height = (height // align) * align
+    return width, height
+
+
+def _upscale_chain(img_bytes: bytes, factor: int) -> tuple[bytes, str, int, int]:
+    """Pass image through Upscayl 2x/4x at a time until we hit the target factor.
+
+    Returns (bytes, mime, width, height). Falls back to PIL Lanczos when
+    Upscayl isn't available. If a pass fails we keep whatever we've got.
+    """
+    if factor <= 1:
+        from PIL import Image as _PIL
+        im = _PIL.open(io.BytesIO(img_bytes))
+        return img_bytes, "image/png", im.width, im.height
+
+    remaining = factor
+    cur_bytes = img_bytes
+    cur_mime = "image/png"
+    last_w = last_h = 0
+    while remaining >= 2:
+        step = 4 if remaining >= 4 else 2
+        log.info("imgen: upscale pass %dx (remaining factor %d)", step, remaining)
+        try:
+            cur_bytes, cur_mime, last_w, last_h = _process_image(
+                cur_bytes, "upscale", {"factor": step}
+            )
+        except Exception as e:
+            log.warning("imgen: upscale stopped at %dx (remaining %d): %s",
+                        factor // remaining, remaining, e)
+            break
+        remaining //= step
+
+    return cur_bytes, cur_mime, last_w, last_h
+
 
 @app.post("/api/imgen")
 async def process_imgen(req: Request) -> dict[str, Any]:
@@ -678,45 +848,139 @@ async def process_imgen(req: Request) -> dict[str, Any]:
         body = await req.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
-        
-    prompt = body.get("prompt", "").strip()
+
+    prompt = (body.get("prompt") or "").strip()
     if not prompt:
         raise HTTPException(status_code=400, detail="Missing 'prompt'")
-        
-    log.info("Generating image for prompt: %s", prompt)
-    
-    def _generate(p: str):
-        pipe = _get_imgen_pipeline()
-        # SDXL Base requires standard steps and resolution
-        neg_prompt = "ugly, deformed, extra limbs, extra fingers, bad anatomy, blurry, worst quality, low resolution, jpeg artifacts"
-        image = pipe(
-            prompt=p, 
-            negative_prompt=neg_prompt,
-            num_inference_steps=25, 
-            guidance_scale=7.5,
-            width=1024,
-            height=1024
-        ).images[0]
-        out = io.BytesIO()
-        image.save(out, format="JPEG", quality=92)
-        return out.getvalue()
-        
+
+    model_key = (body.get("model") or IMGEN_DEFAULT_MODEL).lower()
+    model_key = IMGEN_ALIASES.get(model_key, model_key)
+    if model_key not in IMGEN_MODELS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown imgen model {model_key!r}. Pick from: {sorted(IMGEN_MODELS)}",
+        )
+    cfg = IMGEN_MODELS[model_key]
+
+    width, height = _parse_imgen_size(body, cfg)
+
+    steps = int(body.get("steps") or cfg["default_steps"])
+    steps = max(1, min(steps, 100))
     try:
-        result_bytes = await asyncio.wait_for(
-            asyncio.to_thread(_generate, prompt),
-            timeout=300.0,
+        guidance = float(body.get("guidance", cfg["default_guidance"]))
+    except (TypeError, ValueError):
+        guidance = cfg["default_guidance"]
+    upscale = int(body.get("upscale") or 1)
+    upscale = max(1, min(upscale, 16))   # capped at 16x (e.g. 1024 -> 16384)
+    seed = body.get("seed")
+    negative_prompt = (body.get("negative_prompt")
+                       or "ugly, deformed, extra limbs, extra fingers, bad anatomy, "
+                          "blurry, worst quality, low resolution, jpeg artifacts")
+
+    # Final-size sanity check
+    final_w = width * upscale
+    final_h = height * upscale
+    if max(final_w, final_h) > IMGEN_MAX_OUTPUT_SIDE:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Final size {final_w}x{final_h} exceeds cap "
+                   f"({IMGEN_MAX_OUTPUT_SIDE}px per side). Lower size or upscale factor.",
+        )
+
+    log.info("imgen: model=%s native=%dx%d steps=%d guidance=%.1f upscale=%dx "
+             "final=%dx%d prompt=%r",
+             model_key, width, height, steps, guidance, upscale,
+             final_w, final_h, prompt[:80])
+
+    def _generate() -> bytes:
+        import torch
+        pipe = _get_imgen_pipeline(model_key)
+        kwargs: dict[str, Any] = {
+            "prompt": prompt,
+            "num_inference_steps": steps,
+            "width": width,
+            "height": height,
+        }
+        if cfg["use_cfg"]:
+            kwargs["guidance_scale"] = guidance
+            # FluxPipeline accepts negative_prompt only on FLUX.1-dev; schnell ignores it.
+            if cfg["pipeline_class"] != "FluxPipeline":
+                kwargs["negative_prompt"] = negative_prompt
+        if seed is not None:
+            try:
+                kwargs["generator"] = torch.Generator(device="cuda").manual_seed(int(seed))
+            except (TypeError, ValueError):
+                pass
+        image = pipe(**kwargs).images[0]
+        out = io.BytesIO()
+        image.save(out, format="PNG")
+        return out.getvalue()
+
+    t_gen0 = time.monotonic()
+    try:
+        native_bytes = await asyncio.wait_for(
+            asyncio.to_thread(_generate),
+            timeout=IMGEN_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
-        raise HTTPException(status_code=504, detail="Image generation timed out")
+        raise HTTPException(status_code=504,
+                            detail=f"Image generation timed out after {IMGEN_TIMEOUT_S:.0f}s")
     except Exception as e:
-        log.exception("Image generation failed")
-        raise HTTPException(status_code=500, detail=str(e))
-        
-    b64_out = base64.b64encode(result_bytes).decode("ascii")
-    
+        log.exception("imgen failed")
+        raise HTTPException(status_code=500, detail=f"{e.__class__.__name__}: {e}")
+    t_gen = time.monotonic() - t_gen0
+
+    # Optional AI-upscale chain
+    t_up0 = time.monotonic()
+    if upscale > 1:
+        out_bytes, out_mime, out_w, out_h = await asyncio.wait_for(
+            asyncio.to_thread(_upscale_chain, native_bytes, upscale),
+            timeout=IMGEN_TIMEOUT_S,
+        )
+    else:
+        out_bytes = native_bytes
+        out_mime = "image/png"
+        out_w, out_h = width, height
+    t_up = time.monotonic() - t_up0
+
+    # JPEG-encode huge outputs to keep the response payload manageable.
+    if max(out_w, out_h) >= 4096 and out_mime != "image/jpeg":
+        from PIL import Image as _PIL
+        img = _PIL.open(io.BytesIO(out_bytes)).convert("RGB")
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=92, optimize=True)
+        out_bytes = buf.getvalue()
+        out_mime = "image/jpeg"
+
+    log.info("imgen: done %dx%d %s (%d KB)  gen=%.1fs upscale=%.1fs model=%s",
+             out_w, out_h, out_mime, len(out_bytes) // 1024, t_gen, t_up, model_key)
+
     return {
-        "image": b64_out,
-        "mime": "image/jpeg"
+        "image": base64.b64encode(out_bytes).decode("ascii"),
+        "mime": out_mime,
+        "width": out_w,
+        "height": out_h,
+        "model": model_key,
+        "size": len(out_bytes),
+        "native_width": width,
+        "native_height": height,
+        "upscale": upscale,
+        "gen_seconds": round(t_gen, 2),
+        "upscale_seconds": round(t_up, 2),
+    }
+
+
+@app.get("/api/imgen/models")
+async def imgen_models() -> dict[str, Any]:
+    """List the imgen models the server knows about (for the UI dropdown)."""
+    return {
+        "default": IMGEN_DEFAULT_MODEL,
+        "models": [
+            {"key": k, "hf": v["hf"], "max_native": v["max_native"],
+             "default_steps": v["default_steps"], "uses_cfg": v["use_cfg"]}
+            for k, v in IMGEN_MODELS.items()
+        ],
+        "max_output_side": IMGEN_MAX_OUTPUT_SIDE,
     }
 
 
