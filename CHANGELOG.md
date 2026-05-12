@@ -5,6 +5,23 @@ All notable changes to ShivaGPT are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Server-backed prompt history with up/down arrow nav.** New SQLite
+  database at `data/history.db` records every prompt you send. The
+  composer recalls them with **↑** (older) and **↓** (newer), bash
+  style. Lives on the server so it follows you across browsers and
+  devices (Mac Safari + iPhone share the same history). Up only fires
+  when the cursor is on the first row of the composer; down only fires
+  while you're already navigating, so it doesn't interfere with editing
+  multi-line prompts. **Esc** during nav restores whatever draft you
+  were typing. New `/history` slash command lists recent prompts;
+  `/history search foo` filters; `/history clear` wipes the database.
+  Endpoints: `POST /api/history`, `GET /api/history?q=&limit=`,
+  `DELETE /api/history/{id}`, `DELETE /api/history`. Soft cap of
+  10 000 rows; oldest are trimmed past that. Env knobs:
+  `HISTORY_DB_PATH`, `HISTORY_MAX_ROWS`, `HISTORY_MAX_TEXT_LEN`.
+  Admin-gated by the existing `_check_auth`.
+
+### Added
 - **Inline Chart.js price charts in `/stock` and `/watchlist`.** The
   1-month closing-price sparkline that `/stock` already returned is now
   rendered as an actual line chart inside the message, color-coded by

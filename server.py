@@ -25,6 +25,7 @@ import re
 import secrets
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import tempfile
 import time
@@ -2118,7 +2119,7 @@ async def save_state(req: Request) -> dict[str, bool]:
         body = await req.json()
     except Exception:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
-        
+
     try:
         def _write(data):
             # Atomic write to prevent corruption
@@ -2126,12 +2127,165 @@ async def save_state(req: Request) -> dict[str, bool]:
             with os.fdopen(fd, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
             os.replace(tmp_path, STATE_FILE)
-            
+
         await asyncio.to_thread(_write, body)
         return {"ok": True}
     except Exception as e:
         log.error("Failed to write state.json: %s", e)
         raise HTTPException(status_code=500, detail="Failed to save state")
+
+
+# ---------------------------------------------------------------------------
+# Prompt history (/api/history)
+#
+# SQLite-backed log of every prompt the user has typed, so up/down arrow
+# nav in the composer works across browsers, reloads, and devices (the
+# server is the source of truth, the frontend just caches in RAM).
+#
+# Admin-gated like /api/state — shouldn't leak prompts to random LAN users.
+# Stored in data/history.db. Schema is intentionally minimal; if/when we
+# add multi-user, the next migration adds a user_id column.
+# ---------------------------------------------------------------------------
+
+HISTORY_DB_PATH = Path(os.getenv("HISTORY_DB_PATH", str(DATA_DIR / "history.db")))
+HISTORY_MAX_ROWS = int(os.getenv("HISTORY_MAX_ROWS", "10000"))   # soft cap; we trim past this
+HISTORY_MAX_TEXT_LEN = int(os.getenv("HISTORY_MAX_TEXT_LEN", "100000"))
+
+
+def _history_conn() -> sqlite3.Connection:
+    """Open the history DB, create schema on first call. One connection per
+    call (cheap) — SQLite handles concurrency fine for our write rate."""
+    conn = sqlite3.connect(HISTORY_DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")    # better concurrent read/write
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS prompt_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            text TEXT NOT NULL,
+            ts INTEGER NOT NULL,
+            convo_id TEXT
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_history_ts ON prompt_history(ts DESC)")
+    return conn
+
+
+@app.post("/api/history")
+async def history_append(req: Request) -> dict[str, Any]:
+    """Append one prompt to history. Skips a consecutive duplicate of the
+    most recent entry (bash HISTCONTROL=ignoredups behavior). Returns
+    {"id": int, "skipped": False} or {"skipped": True}."""
+    _check_auth(req)
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON body")
+
+    text = (body.get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Missing 'text'")
+    if len(text) > HISTORY_MAX_TEXT_LEN:
+        raise HTTPException(status_code=413, detail="Text too long for history")
+    convo_id = (body.get("convo_id") or None)
+
+    def _do() -> dict[str, Any]:
+        conn = _history_conn()
+        try:
+            last = conn.execute(
+                "SELECT text FROM prompt_history ORDER BY id DESC LIMIT 1"
+            ).fetchone()
+            if last and last[0] == text:
+                return {"skipped": True}
+            cur = conn.execute(
+                "INSERT INTO prompt_history (text, ts, convo_id) VALUES (?, ?, ?)",
+                (text, int(time.time() * 1000), convo_id),
+            )
+            # Soft cap: trim oldest beyond HISTORY_MAX_ROWS.
+            n = conn.execute("SELECT COUNT(*) FROM prompt_history").fetchone()[0]
+            if n > HISTORY_MAX_ROWS:
+                conn.execute(
+                    "DELETE FROM prompt_history WHERE id IN ("
+                    "  SELECT id FROM prompt_history ORDER BY id ASC LIMIT ?"
+                    ")", (n - HISTORY_MAX_ROWS,)
+                )
+            conn.commit()
+            return {"id": cur.lastrowid, "skipped": False}
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(_do)
+
+
+@app.get("/api/history")
+async def history_list(req: Request) -> dict[str, Any]:
+    """Return prompt history, newest first. Supports limit and optional
+    substring search via ?q=."""
+    _check_auth(req)
+    try:
+        limit = max(1, min(int(req.query_params.get("limit", "500")), 5000))
+    except ValueError:
+        limit = 500
+    q = (req.query_params.get("q") or "").strip()
+
+    def _do() -> dict[str, Any]:
+        conn = _history_conn()
+        try:
+            if q:
+                rows = conn.execute(
+                    "SELECT id, text, ts, convo_id FROM prompt_history "
+                    "WHERE text LIKE ? ORDER BY id DESC LIMIT ?",
+                    (f"%{q}%", limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    "SELECT id, text, ts, convo_id FROM prompt_history "
+                    "ORDER BY id DESC LIMIT ?",
+                    (limit,),
+                ).fetchall()
+            return {
+                "history": [
+                    {"id": r[0], "text": r[1], "ts": r[2], "convo_id": r[3]}
+                    for r in rows
+                ],
+                "count": len(rows),
+            }
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(_do)
+
+
+@app.delete("/api/history/{entry_id}")
+async def history_delete_one(entry_id: int, req: Request) -> dict[str, Any]:
+    """Delete one history entry by id."""
+    _check_auth(req)
+
+    def _do() -> dict[str, Any]:
+        conn = _history_conn()
+        try:
+            cur = conn.execute("DELETE FROM prompt_history WHERE id = ?", (entry_id,))
+            conn.commit()
+            return {"ok": True, "deleted": cur.rowcount}
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(_do)
+
+
+@app.delete("/api/history")
+async def history_clear(req: Request) -> dict[str, Any]:
+    """Wipe all history."""
+    _check_auth(req)
+
+    def _do() -> dict[str, Any]:
+        conn = _history_conn()
+        try:
+            cur = conn.execute("DELETE FROM prompt_history")
+            conn.commit()
+            return {"ok": True, "deleted": cur.rowcount}
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(_do)
 
 
 # ---------------------------------------------------------------------------

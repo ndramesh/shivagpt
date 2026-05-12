@@ -2131,6 +2131,7 @@
         { name: '/portfolio', desc: 'Your Alpaca account: balances + open positions (read-only)', hasArgs: false },
         { name: '/tp', desc: 'Your Schwab / ThinkOrSwim account: balances + positions (read-only)', hasArgs: false },
         { name: '/watchlist', desc: 'Track tickers — `add NVDA AAPL`, `remove TSLA`, `clear`, or no args to list', hasArgs: true, hint: '[add|remove|clear] [tickers]' },
+        { name: '/history', desc: 'Recent prompts (↑/↓ in composer to walk through). `clear` to wipe', hasArgs: true, hint: '[clear|search <text>]' },
       ];
 
       const BUILT_IN_PRESETS = [
@@ -2174,6 +2175,8 @@
         convos: load(LS.convos, []),
         presets: load(LS.presets, []),
         watchlist: load(LS.watchlist, []),
+        history: [],                 // server-backed prompt history (RAM cache, newest first)
+        historyLoaded: false,        // becomes true once we've fetched once
         activeId: localStorage.getItem(LS.activeId) || null,
         adminToken: localStorage.getItem('sgpt_adminToken') || null,
         models: [],         // list from /api/models
@@ -3060,6 +3063,103 @@
       /* ---------- Attachment state ---------- */
       let pendingFiles = [];  // { kind, filename, base64?, text?, mime, uploading? }
 
+      /* ---------- Prompt history (server-backed, up/down arrow nav) ---------- */
+      // _historyNav.index: -1 = not navigating (showing draft)
+      //                     0..N-1 = position in state.history (newest=0)
+      // _historyNav.draft : the in-progress text the user had typed before
+      //                     starting to navigate; restored on Esc or when
+      //                     they walk past the most recent entry.
+      let _historyNav = { index: -1, draft: '' };
+
+      async function loadPromptHistory() {
+        if (!state.adminToken) return;
+        try {
+          const r = await fetch('/api/history?limit=500', {
+            headers: { 'Authorization': `Bearer ${state.adminToken}` },
+          });
+          if (r.status === 401) return;   // not logged in
+          if (!r.ok) throw new Error('HTTP ' + r.status);
+          const data = await r.json();
+          state.history = data.history || [];
+          state.historyLoaded = true;
+        } catch (e) {
+          console.warn('Could not load prompt history:', e);
+        }
+      }
+
+      async function appendPromptHistory(text, convoId) {
+        if (!state.adminToken || !text) return;
+        // Optimistic local prepend (dedupe consecutive identical entries to
+        // match what the server does).
+        if (!Array.isArray(state.history)) state.history = [];
+        if (!state.history.length || state.history[0].text !== text) {
+          state.history.unshift({ id: null, text, ts: Date.now(), convo_id: convoId || null });
+          // Keep RAM cache from growing unbounded.
+          if (state.history.length > 1000) state.history.length = 1000;
+        }
+        try {
+          await fetch('/api/history', {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${state.adminToken}`,
+            },
+            body: JSON.stringify({ text, convo_id: convoId || null }),
+          });
+        } catch (e) {
+          // Server append failure is non-fatal — RAM cache still works for
+          // up/down nav until next reload.
+          console.warn('history append failed:', e);
+        }
+      }
+
+      function cursorOnFirstRow(ta) {
+        // Empty composer always counts.
+        if (!ta.value) return true;
+        // Cursor must be at-or-before the first newline.
+        const pos = ta.selectionStart;
+        const firstNl = ta.value.indexOf('\n');
+        return firstNl < 0 ? true : pos <= firstNl;
+      }
+      function cursorOnLastRow(ta) {
+        if (!ta.value) return true;
+        const pos = ta.selectionStart;
+        const lastNl = ta.value.lastIndexOf('\n');
+        return lastNl < 0 ? true : pos > lastNl;
+      }
+
+      function historyNavStep(ta, delta) {
+        // delta = +1 → older (further back); delta = -1 → newer
+        if (_historyNav.index === -1 && delta > 0) {
+          _historyNav.draft = ta.value;
+        }
+        const next = _historyNav.index + delta;
+        if (next < -1) return;
+        if (next >= state.history.length) return;
+        _historyNav.index = next;
+        if (_historyNav.index === -1) {
+          ta.value = _historyNav.draft || '';
+        } else {
+          ta.value = state.history[_historyNav.index].text || '';
+        }
+        autoSize(ta);
+        // Place cursor at start for further ↑, end for further ↓ — keeps
+        // navigation predictable when entries span multiple lines.
+        const pos = delta > 0 ? 0 : ta.value.length;
+        try { ta.setSelectionRange(pos, pos); } catch (e) { /* ignore */ }
+      }
+      function historyNavRestore(ta) {
+        ta.value = _historyNav.draft || '';
+        autoSize(ta);
+        _historyNav.index = -1;
+        _historyNav.draft = '';
+      }
+      function historyNavReset() {
+        // Called after send() so the next ↑ starts at the newest entry again.
+        _historyNav.index = -1;
+        _historyNav.draft = '';
+      }
+
       /* ---------- Voice input (MediaRecorder + /api/transcribe) ---------- */
       let _voiceState = { recorder: null, chunks: [], stream: null, recording: false };
 
@@ -3450,6 +3550,11 @@
         const text = $('composer').value.trim();
         // Allow send if there's text OR attachments
         if (!text && !pendingFiles.length) return;
+
+        // Record the prompt to server-backed history so ↑/↓ nav covers it.
+        // Fire-and-forget; we don't need to await before sending.
+        if (text) appendPromptHistory(text, getActive()?.id);
+        historyNavReset();
 
         // Handle slash commands (executed on enter)
         if (text.startsWith('/')) {
@@ -4340,6 +4445,66 @@
               url: fUrl,
               instructions: fInstr || '',
             }, c, asst, contentEl, cursor, 'Fetching the page…');
+            break;
+          }
+
+          case '/history': {
+            // /history                  → render the recent prompt list
+            // /history search <text>    → filter then render
+            // /history clear            → DELETE /api/history (with confirm)
+            const tokens = (args || '').trim().split(/\s+/).filter(Boolean);
+            const sub = (tokens[0] || '').toLowerCase();
+            if (sub === 'clear') {
+              if (!state.adminToken) { toast('Admin login required'); break; }
+              if (!confirm('Clear all prompt history on the server? This cannot be undone.')) break;
+              try {
+                const r = await fetch('/api/history', {
+                  method: 'DELETE',
+                  headers: { 'Authorization': `Bearer ${state.adminToken}` },
+                });
+                if (!r.ok) throw new Error('HTTP ' + r.status);
+                state.history = [];
+                _historyNav = { index: -1, draft: '' };
+                toast('History cleared');
+              } catch (e) {
+                toast('Failed: ' + (e.message || e));
+              }
+              break;
+            }
+            // Build the displayed list
+            let entries = Array.isArray(state.history) ? state.history.slice() : [];
+            let title = `## Recent prompts (${entries.length})`;
+            if (sub === 'search') {
+              const q = tokens.slice(1).join(' ').toLowerCase();
+              if (!q) { toast('Usage: /history search <text>'); break; }
+              entries = entries.filter(h => (h.text || '').toLowerCase().includes(q));
+              title = `## Prompts matching "${q}" (${entries.length})`;
+            }
+
+            if (!c) c = newConvo();
+            c.messages.push({ role: 'user', content: `/history${args ? ' ' + args : ''}`, ts: Date.now() });
+            autoTitleFromFirstUserMsg(c);
+            c.updatedAt = Date.now();
+            persistAll();
+            renderSidebar();
+
+            let md = title + '\n\n';
+            if (!entries.length) {
+              md += '*No matching prompts yet — anything you send appears here, and is recallable via ↑/↓ in the composer.*';
+            } else {
+              md += `Use ↑/↓ in the composer to recall any of these. Showing newest first:\n\n`;
+              for (const h of entries.slice(0, 50)) {
+                const oneLine = (h.text || '').replace(/\n/g, ' \\n ');
+                const preview = oneLine.length > 200 ? oneLine.slice(0, 200) + '…' : oneLine;
+                md += `- ${preview}\n`;
+              }
+              if (entries.length > 50) md += `\n*(${entries.length - 50} more not shown)*\n`;
+              md += `\n_To wipe: \`/history clear\`._`;
+            }
+            c.messages.push({ role: 'system', content: md, ts: Date.now() });
+            persistAll();
+            renderActive();
+            scrollToBottom();
             break;
           }
 
@@ -5311,6 +5476,10 @@
           } catch (e) {
             console.error('Failed to load initial state', e);
           }
+
+          // Pull server-backed prompt history (best-effort; UI degrades to
+          // localStorage-only nav if the server is unreachable).
+          loadPromptHistory();
         }
 
         // Login UI
@@ -5397,6 +5566,31 @@
               menu.classList.remove('show');
               return;
             }
+          }
+
+          // ===== Composer history nav (bash-like) =====
+          // Up:   if cursor is on the first visible row → recall older prompt
+          // Down: if cursor is on the last visible row AND we're navigating
+          //       → walk forward (or restore draft when we exit the top)
+          // Esc:  while navigating → restore in-progress draft and exit
+          if (e.key === 'ArrowUp' && state.history && state.history.length) {
+            if (cursorOnFirstRow(ta)) {
+              e.preventDefault();
+              historyNavStep(ta, +1);
+              return;
+            }
+          }
+          if (e.key === 'ArrowDown' && _historyNav.index >= 0) {
+            if (cursorOnLastRow(ta)) {
+              e.preventDefault();
+              historyNavStep(ta, -1);
+              return;
+            }
+          }
+          if (e.key === 'Escape' && _historyNav.index >= 0 && !state.streaming) {
+            e.preventDefault();
+            historyNavRestore(ta);
+            return;
           }
 
           if (e.key === 'Enter' && !e.shiftKey && !composing) {
