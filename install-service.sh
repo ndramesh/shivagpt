@@ -49,6 +49,11 @@ if [ ! -f "$SERVER_PY" ]; then
   exit 1
 fi
 
+# Make sure ReadWritePaths targets actually exist so systemd can mount them
+# read-writable. Running as root here, but su to the owning user so we don't
+# create root-owned directories under their HOME.
+sudo -u "$RUN_USER" mkdir -p "$RUN_HOME/.cache/huggingface/hub" "$RUN_HOME/.ssh"
+
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 
 echo "==> Writing $UNIT_PATH"
@@ -82,7 +87,13 @@ NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=read-only
-ReadWritePaths=$SCRIPT_DIR
+# $SCRIPT_DIR is the project (state.json, data/, history.db).
+# ~/.cache/huggingface is where diffusers / transformers / faster-whisper
+#   cache model weights — without this, /imgen and /api/transcribe error with
+#   "Read-only file system" on first model fetch.
+# ~/.ssh lets /codereview's SSH path form auto-accept new host keys (and
+#   write to known_hosts) instead of failing on first contact.
+ReadWritePaths=$SCRIPT_DIR $RUN_HOME/.cache/huggingface $RUN_HOME/.ssh
 
 [Install]
 WantedBy=multi-user.target

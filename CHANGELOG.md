@@ -4,6 +4,17 @@ All notable changes to ShivaGPT are documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+- **`/imgen` and `/api/transcribe` hit EROFS on first model download.**
+  Root cause: the systemd unit shipped with `ProtectHome=read-only` and
+  `ReadWritePaths=$SCRIPT_DIR`, which made `~/.cache/huggingface`
+  read-only — so diffusers/transformers/faster-whisper couldn't write
+  weights on first fetch. `install-service.sh` now adds both
+  `~/.cache/huggingface` and `~/.ssh` (the latter unblocks
+  `StrictHostKeyChecking=accept-new` for `/codereview`'s SSH path form)
+  to `ReadWritePaths`, and pre-creates the directories so systemd has
+  something to mount.
+
 ### Added
 - **Server-backed prompt history with up/down arrow nav.** New SQLite
   database at `data/history.db` records every prompt you send. The
