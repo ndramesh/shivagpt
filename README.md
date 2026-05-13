@@ -376,6 +376,63 @@ and nothing else. There are no order-submission endpoints anywhere on
 this server. Requires `APCA_API_KEY_ID` / `APCA_API_SECRET_KEY` in
 the systemd unit (same keys used by `/stock`).
 
+## Email delivery from scheduled tasks
+
+Any schedule can mail its output. The system uses stdlib SMTP+STARTTLS,
+so anything that speaks SMTP works (Gmail with an app password, iCloud,
+Fastmail, your own postfix).
+
+### Gmail setup (most common)
+
+1. Turn on 2-Step Verification at <https://myaccount.google.com/security>
+   (Gmail requires this before app passwords are available).
+2. Go to <https://myaccount.google.com/apppasswords>. Create a new app
+   password — name it "ShivaGPT." Google shows you a 16-character code;
+   copy it (you won't see it again).
+3. Add the credentials to the systemd unit:
+   ```bash
+   ssh kailash 'sudo systemctl edit shivagpt'
+   # add:
+   [Service]
+   Environment=SMTP_HOST=smtp.gmail.com
+   Environment=SMTP_PORT=587
+   Environment=SMTP_USER=your.address@gmail.com
+   Environment=SMTP_PASS=the-16-char-app-password
+   Environment=SMTP_FROM=your.address@gmail.com
+   Environment=EMAIL_TO_DEFAULT=your.address@gmail.com
+   ssh kailash 'sudo systemctl restart shivagpt'
+   ```
+4. From a logged-in browser session, verify with:
+   ```
+   curl -X POST -H "Authorization: Bearer $YOUR_ADMIN_TOKEN" \
+        http://kailash:8000/api/email/test
+   ```
+   (or open DevTools and do a `fetch` from the browser console). Check
+   your inbox — you should see a small "ShivaGPT email test" message.
+
+### iCloud setup
+
+Same as Gmail, with `SMTP_HOST=smtp.mail.me.com`, port 587, your iCloud
+address as user, and an [app-specific password from appleid.apple.com](https://account.apple.com/account/manage).
+
+### Attaching email to a schedule
+
+```
+/schedule add morning_brief "weekday 07:00" morning_brief NVDA,AAPL,TSLA,MSFT,SPY,QQQ -email me@example.com
+/schedule add pre_market "weekday 06:45" premarket NVDA,AAPL,TSLA -email me@example.com
+/schedule add weekly_news "monday 08:00" top_news SPY,QQQ -email me@example.com
+```
+
+(Yes, `monday HH:MM` is just `weekday HH:MM` — there's no per-day-of-week
+form right now. The scheduler will fire every weekday at the time.)
+
+`/schedule list` shows each schedule's email destination. Each run also
+records whether the email actually went out (visible in `task_runs`).
+
+If the SMTP send fails, the run is *not* marked failed — the data still
+got generated and stored in `task_runs`, just not delivered. The
+systemd journal will log the SMTP error.
+
 ## ThinkOrSwim / Schwab (`/tp`)
 
 `/tp` shows your Schwab/ThinkOrSwim account balances and positions

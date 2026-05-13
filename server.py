@@ -2749,6 +2749,125 @@ async def ask(req: Request) -> StreamingResponse:
 
 
 # ---------------------------------------------------------------------------
+# Email delivery (SMTP via stdlib smtplib)
+#
+# Used by scheduled tasks that want their output mailed (a morning brief,
+# pre-market summary, top news). Plain SMTP+STARTTLS — works against Gmail
+# (with an app password), iCloud, your own postfix box, etc.
+# ---------------------------------------------------------------------------
+
+SMTP_HOST = os.getenv("SMTP_HOST", "")
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))
+SMTP_USER = os.getenv("SMTP_USER", "")
+SMTP_PASS = os.getenv("SMTP_PASS", "")
+SMTP_FROM = os.getenv("SMTP_FROM", "") or SMTP_USER
+SMTP_USE_TLS = (os.getenv("SMTP_USE_TLS", "1").strip().lower() in {"1", "true", "yes", "on"})
+EMAIL_TO_DEFAULT = os.getenv("EMAIL_TO_DEFAULT", "")
+
+
+def _email_html_wrap(body_html: str, title: str) -> str:
+    """Wrap rendered HTML in a dark-ish styled outer doc that gmail/icloud accept."""
+    return (
+        '<!DOCTYPE html><html><head><meta charset="utf-8">'
+        f'<title>{title}</title></head>'
+        '<body style="margin:0;padding:0;background:#0b0c10;color:#e6e7eb;'
+        'font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Helvetica,Arial,sans-serif;font-size:14px;line-height:1.55;">'
+        '<div style="max-width:680px;margin:0 auto;padding:24px;">'
+        f'{body_html}'
+        '<hr style="border:none;border-top:1px solid #2a2d3a;margin:24px 0 8px;">'
+        '<div style="color:#8a8e9c;font-size:12px;">Sent by ShivaGPT.</div>'
+        '</div></body></html>'
+    )
+
+
+def _markdown_to_html(md: str) -> str:
+    """Render the markdown a recipe produces into reasonable HTML. Falls
+    back to a <pre>-wrapped text version if the markdown lib is missing."""
+    try:
+        import markdown as _md
+        html = _md.markdown(
+            md or "",
+            extensions=["fenced_code", "tables", "nl2br", "sane_lists"],
+        )
+    except ImportError:
+        from html import escape as _esc
+        html = f'<pre style="white-space:pre-wrap;font-family:ui-monospace,Menlo,monospace;">{_esc(md or "")}</pre>'
+    # Style tables minimally for mail clients
+    html = html.replace("<table>", '<table style="border-collapse:collapse;margin:8px 0;">')
+    html = html.replace("<th>", '<th style="text-align:left;padding:4px 10px;border:1px solid #2a2d3a;background:#161823;">')
+    html = html.replace("<td>", '<td style="padding:4px 10px;border:1px solid #2a2d3a;">')
+    return html
+
+
+def _send_email(to_addr: str, subject: str, body_markdown: str) -> dict[str, Any]:
+    """Send a markdown-bodied email. Returns delivery metadata or raises HTTPException."""
+    if not SMTP_HOST or not SMTP_FROM:
+        raise HTTPException(
+            status_code=503,
+            detail="SMTP not configured. Set SMTP_HOST, SMTP_USER, SMTP_PASS, "
+                   "SMTP_FROM in the systemd unit. See README.",
+        )
+    to = (to_addr or EMAIL_TO_DEFAULT or "").strip()
+    if not to:
+        raise HTTPException(status_code=400, detail="No recipient (set EMAIL_TO_DEFAULT or pass an explicit address).")
+
+    import smtplib
+    from email.mime.text import MIMEText
+    from email.mime.multipart import MIMEMultipart
+    from email.utils import formatdate, make_msgid
+
+    html_body = _email_html_wrap(_markdown_to_html(body_markdown), subject)
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"] = SMTP_FROM
+    msg["To"] = to
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain="shivagpt.local")
+    msg.attach(MIMEText(body_markdown or "", "plain", "utf-8"))
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    log.info("email: send to=%s subject=%r host=%s:%d", to, subject, SMTP_HOST, SMTP_PORT)
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+            s.ehlo()
+            if SMTP_USE_TLS:
+                s.starttls()
+                s.ehlo()
+            if SMTP_USER and SMTP_PASS:
+                s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+    except smtplib.SMTPAuthenticationError as e:
+        raise HTTPException(status_code=502, detail=f"SMTP auth failed: {e}")
+    except smtplib.SMTPException as e:
+        raise HTTPException(status_code=502, detail=f"SMTP error: {e}")
+    except OSError as e:
+        raise HTTPException(status_code=502, detail=f"SMTP connection failed: {e}")
+    return {"to": to, "subject": subject, "from": SMTP_FROM, "size": len(html_body)}
+
+
+@app.post("/api/email/test")
+async def email_test(req: Request) -> dict[str, Any]:
+    """Send a small test email so the operator can verify SMTP creds."""
+    _check_auth(req)
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    to_addr = (body.get("to") or "").strip() or EMAIL_TO_DEFAULT
+    if not to_addr:
+        raise HTTPException(400, "Need 'to' or EMAIL_TO_DEFAULT env var")
+    subject = body.get("subject") or "ShivaGPT email test"
+    msg = body.get("text") or (
+        f"This is a test email from ShivaGPT.\n\n"
+        f"- Sent at: {time.ctime()}\n"
+        f"- SMTP host: `{SMTP_HOST}:{SMTP_PORT}`\n"
+        f"- From: `{SMTP_FROM}`\n\n"
+        "If this lands in your inbox, scheduled tasks can now mail their output."
+    )
+    return await asyncio.to_thread(_send_email, to_addr, subject, msg)
+
+
+# ---------------------------------------------------------------------------
 # Scheduled tasks (/api/schedules/*)
 #
 # A small in-process scheduler. No external dep (no APScheduler) — an
@@ -2791,6 +2910,10 @@ def _schedule_conn() -> sqlite3.Connection:
             created_at INTEGER NOT NULL
         )
     """)
+    # Migration: add email_to column if missing.
+    existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(schedules)").fetchall()}
+    if "email_to" not in existing_cols:
+        conn.execute("ALTER TABLE schedules ADD COLUMN email_to TEXT")
     conn.execute("""
         CREATE TABLE IF NOT EXISTS task_runs (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2802,6 +2925,10 @@ def _schedule_conn() -> sqlite3.Connection:
             FOREIGN KEY (schedule_id) REFERENCES schedules(id)
         )
     """)
+    # Add email_sent column if missing
+    tr_cols = {row[1] for row in conn.execute("PRAGMA table_info(task_runs)").fetchall()}
+    if "email_sent" not in tr_cols:
+        conn.execute("ALTER TABLE task_runs ADD COLUMN email_sent INTEGER DEFAULT 0")
     conn.execute("CREATE INDEX IF NOT EXISTS idx_taskruns_sched ON task_runs(schedule_id, started_at DESC)")
     return conn
 
@@ -2965,21 +3092,198 @@ async def _recipe_ask(args: str) -> str:
     return f"## Ask `{kb_name}` — {question}\n\n{data.get('message', {}).get('content', '')}"
 
 
+async def _recipe_top_news(args: str) -> str:
+    """Aggregate recent news for a list of tickers (defaults to broad indices).
+
+    args: comma-separated tickers, or a JSON list. Empty → uses indices that
+    typically have wide-ranging news (SPY, QQQ, ^GSPC).
+    """
+    args = (args or "").strip()
+    if args.startswith("["):
+        try:
+            tickers = [t.upper() for t in json.loads(args)]
+        except Exception:
+            tickers = []
+    elif args:
+        tickers = [t.strip().upper() for t in args.split(",") if t.strip()]
+    else:
+        tickers = ["SPY", "QQQ", "^GSPC"]
+
+    items: list[dict] = []
+    for t in tickers[:12]:
+        try:
+            extras = await asyncio.to_thread(_yf_consensus_and_news, t)
+            for n in extras.get("news", [])[:3]:
+                items.append({"ticker": t, **n})
+        except Exception as e:
+            log.debug("news fetch for %s failed: %s", t, e)
+    # Newest first; published can be epoch-seconds or an iso string
+    def _pub(n):
+        p = n.get("published")
+        if isinstance(p, (int, float)):
+            return float(p)
+        if isinstance(p, str):
+            try:
+                import datetime as dt
+                return dt.datetime.fromisoformat(p.replace("Z", "+00:00")).timestamp()
+            except Exception:
+                return 0.0
+        return 0.0
+    items.sort(key=_pub, reverse=True)
+    items = items[:18]
+
+    if not items:
+        return "_No news returned. Yahoo's news feed is sometimes empty or rate-limited; try again later._"
+    out = ["## Top news\n"]
+    for n in items:
+        title = (n.get("title") or "?").strip()
+        publisher = (n.get("publisher") or "").strip()
+        link = (n.get("link") or "#").strip()
+        out.append(f"- **[{n['ticker']}]** [{title}]({link})" +
+                   (f" · _{publisher}_" if publisher else ""))
+    return "\n".join(out)
+
+
+async def _recipe_premarket(args: str) -> str:
+    """Pre/post-market snapshot for a list of tickers.
+
+    Uses Alpaca's latest_trade (which captures extended hours) when available
+    and falls back to the most recent daily bar. Output highlights tickers
+    that have moved >0.5% vs the regular-session previous close.
+    """
+    args = (args or "").strip()
+    if args.startswith("["):
+        try:
+            tickers = [t.upper() for t in json.loads(args)]
+        except Exception:
+            tickers = []
+    else:
+        tickers = [t.strip().upper() for t in args.split(",") if t.strip()]
+    if not tickers:
+        return "_recipe `premarket` needs a comma-separated ticker list._"
+
+    async def _one(t):
+        try:
+            q = await asyncio.to_thread(_alpaca_quote_and_bars, t, 5)
+            if not q:
+                return None
+            return {"ticker": t, **q}
+        except Exception:
+            return None
+    quotes = [q for q in await asyncio.gather(*[_one(t) for t in tickers[:20]]) if q]
+    if not quotes:
+        return "_No pre-market data available (Alpaca might not be configured)._"
+
+    movers = [q for q in quotes if abs(q.get("change_pct") or 0) >= 0.5]
+    movers.sort(key=lambda q: abs(q.get("change_pct") or 0), reverse=True)
+
+    out = [f"## Pre/post-market snapshot — {len(quotes)} ticker(s)\n"]
+    if movers:
+        out.append("### Movers (≥ 0.5% from prev close)\n")
+        out.append("| Ticker | Last | vs Prev close |\n|---|---:|---:|")
+        for q in movers:
+            arrow = "▲" if q["change"] >= 0 else "▼"
+            out.append(f"| **{q['ticker']}** | ${q['price']:,.2f} | {arrow} ${abs(q['change']):,.2f} ({q['change_pct']:+.2f}%) |")
+        out.append("")
+    quiet = [q for q in quotes if q not in movers]
+    if quiet:
+        out.append("### Quiet\n")
+        out.append("| Ticker | Last | vs Prev close |\n|---|---:|---:|")
+        for q in quiet:
+            arrow = "▲" if q["change"] >= 0 else "▼"
+            out.append(f"| {q['ticker']} | ${q['price']:,.2f} | {arrow} {q['change_pct']:+.2f}% |")
+    return "\n".join(out)
+
+
+async def _recipe_morning_brief(args: str) -> str:
+    """Composite brief: portfolio + premarket + watchlist + top news.
+
+    args: comma-separated watchlist tickers (used for premarket + news +
+    watchlist sections). Falls back to portfolio positions for news if no
+    tickers are provided.
+    """
+    args = (args or "").strip()
+    sections: list[str] = [
+        f"# Morning brief — {time.strftime('%a %b %d, %Y')}\n",
+    ]
+
+    # Portfolio summary
+    try:
+        port = await _recipe_portfolio("")
+    except Exception as e:
+        port = f"_Portfolio section failed: {e}_"
+    sections.append(port)
+
+    # Pre-market snapshot (only useful if we have tickers)
+    if args:
+        try:
+            pm = await _recipe_premarket(args)
+            sections.append(pm)
+        except Exception as e:
+            sections.append(f"_Pre-market section failed: {e}_")
+
+    # Watchlist quotes
+    if args:
+        try:
+            wl = await _recipe_watchlist(args)
+            sections.append(wl)
+        except Exception as e:
+            sections.append(f"_Watchlist section failed: {e}_")
+
+    # Top news. If no tickers given, try to pull positions and use those.
+    try:
+        news_args = args
+        if not news_args:
+            tc = _alpaca_trading_client()
+            if tc is not None:
+                positions = await asyncio.to_thread(tc.get_all_positions)
+                news_args = ",".join(p.symbol for p in positions[:8])
+        news = await _recipe_top_news(news_args)
+        sections.append(news)
+    except Exception as e:
+        sections.append(f"_News section failed: {e}_")
+
+    return "\n\n---\n\n".join(sections)
+
+
 RECIPES = {
     "portfolio": _recipe_portfolio,
     "watchlist": _recipe_watchlist,
     "stock": _recipe_stock,
     "ask": _recipe_ask,
+    "top_news": _recipe_top_news,
+    "premarket": _recipe_premarket,
+    "morning_brief": _recipe_morning_brief,
 }
 
 
 async def _run_schedule_now(sched_row: tuple) -> int:
-    """Execute a scheduled task once and append a row to task_runs.
-    Returns the task_run id."""
-    sched_id, name, when_spec, recipe, recipe_args, *_ = sched_row
+    """Execute a scheduled task once, optionally email the output, and append
+    a row to task_runs. Returns the task_run id."""
+    # Schema: id, name, when_spec, recipe, recipe_args, enabled,
+    #         last_run_ts, next_run_ts, [created_at,] email_to (since migration)
+    sched_id = sched_row[0]
+    name = sched_row[1]
+    when_spec = sched_row[2]
+    recipe = sched_row[3]
+    recipe_args = sched_row[4]
+    # email_to is the LAST column we added; depending on caller's SELECT it
+    # may or may not be present. We re-fetch it to be safe.
+    def _fetch_email_to():
+        conn = _schedule_conn()
+        try:
+            row = conn.execute(
+                "SELECT email_to FROM schedules WHERE id = ?", (sched_id,)
+            ).fetchone()
+            return (row[0] if row and row[0] else None)
+        finally:
+            conn.close()
+    email_to = await asyncio.to_thread(_fetch_email_to)
+
     fn = RECIPES.get(recipe)
     started = int(time.time() * 1000)
-    log.info("schedule: running id=%d name=%r recipe=%r", sched_id, name, recipe)
+    log.info("schedule: running id=%d name=%r recipe=%r email=%s",
+             sched_id, name, recipe, email_to or "(none)")
     try:
         if fn is None:
             output = f"_Unknown recipe `{recipe}`._"
@@ -2992,13 +3296,27 @@ async def _run_schedule_now(sched_row: tuple) -> int:
         output = f"_Task failed: {e.__class__.__name__}: {e}_"
         ok = 0
     finished = int(time.time() * 1000)
+
+    # Optional email delivery — failure to send is captured but doesn't
+    # mark the run as failed (the data was generated successfully).
+    email_sent = 0
+    if ok and email_to:
+        try:
+            subject = f"[ShivaGPT] {name} · {time.strftime('%a %b %d')}"
+            await asyncio.to_thread(_send_email, email_to, subject, output)
+            email_sent = 1
+        except HTTPException as e:
+            log.warning("schedule %d: email send failed: %s", sched_id, e.detail)
+        except Exception as e:
+            log.warning("schedule %d: email send failed: %s", sched_id, e)
+
     def _persist():
         conn = _schedule_conn()
         try:
             cur = conn.execute(
-                "INSERT INTO task_runs (schedule_id, started_at, finished_at, ok, output) "
-                "VALUES (?, ?, ?, ?, ?)",
-                (sched_id, started, finished, ok, output),
+                "INSERT INTO task_runs (schedule_id, started_at, finished_at, ok, output, email_sent) "
+                "VALUES (?, ?, ?, ?, ?, ?)",
+                (sched_id, started, finished, ok, output, email_sent),
             )
             # Compute next_run_ts based on current spec
             next_ts = _next_run_after(when_spec, time.time())
@@ -3055,15 +3373,16 @@ async def schedules_list(req: Request) -> dict[str, Any]:
         try:
             rows = conn.execute(
                 "SELECT id, name, when_spec, recipe, recipe_args, enabled, "
-                "       last_run_ts, next_run_ts, created_at "
+                "       last_run_ts, next_run_ts, created_at, email_to "
                 "FROM schedules ORDER BY id DESC"
             ).fetchall()
             return {"schedules": [
                 {"id": r[0], "name": r[1], "when": r[2], "recipe": r[3],
                  "recipe_args": r[4], "enabled": bool(r[5]),
-                 "last_run_ts": r[6], "next_run_ts": r[7], "created_at": r[8]}
+                 "last_run_ts": r[6], "next_run_ts": r[7], "created_at": r[8],
+                 "email_to": r[9]}
                 for r in rows
-            ]}
+            ], "recipes": sorted(RECIPES.keys())}
         finally:
             conn.close()
     return await asyncio.to_thread(_do)
@@ -3080,6 +3399,7 @@ async def schedules_create(req: Request) -> dict[str, Any]:
     when_spec = (body.get("when") or "").strip()
     recipe = (body.get("recipe") or "").strip().lower()
     recipe_args = (body.get("recipe_args") or "").strip()
+    email_to = (body.get("email_to") or "").strip() or None
     if not name or not when_spec or not recipe:
         raise HTTPException(400, "Need name, when, and recipe")
     if recipe not in RECIPES:
@@ -3093,13 +3413,14 @@ async def schedules_create(req: Request) -> dict[str, Any]:
         try:
             cur = conn.execute(
                 "INSERT INTO schedules (name, when_spec, recipe, recipe_args, "
-                "                       enabled, next_run_ts, created_at) "
-                "VALUES (?, ?, ?, ?, 1, ?, ?)",
+                "                       enabled, next_run_ts, created_at, email_to) "
+                "VALUES (?, ?, ?, ?, 1, ?, ?, ?)",
                 (name, when_spec, recipe, recipe_args,
-                 int(next_ts * 1000), int(time.time() * 1000)),
+                 int(next_ts * 1000), int(time.time() * 1000), email_to),
             )
             conn.commit()
-            return {"id": cur.lastrowid, "next_run_ts": int(next_ts * 1000)}
+            return {"id": cur.lastrowid, "next_run_ts": int(next_ts * 1000),
+                    "email_to": email_to}
         finally:
             conn.close()
     return await asyncio.to_thread(_do)

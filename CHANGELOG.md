@@ -5,6 +5,23 @@ All notable changes to ShivaGPT are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **Scheduled tasks can email their output.** New SMTP delivery layer
+  using stdlib `smtplib` + `markdown` for HTML rendering. Configure
+  via `SMTP_HOST`, `SMTP_PORT` (default 587), `SMTP_USER`, `SMTP_PASS`,
+  `SMTP_FROM`, `SMTP_USE_TLS` (default 1), `EMAIL_TO_DEFAULT`.
+  `POST /api/email/test` sends a small test message so you can verify
+  credentials. `/schedule add ... -email me@example.com` attaches an
+  email destination to any schedule; output is rendered to nicely-styled
+  HTML and delivered after each successful run.
+- **Three new scheduler recipes for market briefs:**
+    - `morning_brief TICKERS` — composite: portfolio + pre-market
+      movers + watchlist quotes + top news, in one email-ready brief.
+    - `premarket TICKERS` — Alpaca-backed pre/post-market snapshot
+      flagging tickers that moved ≥0.5% from prev close.
+    - `top_news TICKERS` — aggregates recent Yahoo headlines across the
+      tickers you pass (or defaults to broad indices SPY/QQQ/^GSPC).
+
+### Added
 - **RAG knowledge bases (`/kb` + `/ask`).** Drop a folder of docs into
   a named knowledge base; the server chunks them paragraph-aware
   (~1000 chars with 150 char overlap), embeds via Ollama's

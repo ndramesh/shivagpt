@@ -3559,8 +3559,25 @@
         if (text) appendPromptHistory(text, getActive()?.id);
         historyNavReset();
 
-        // Handle slash commands (executed on enter)
+        // Handle slash commands (executed on enter).
+        //
+        // Multi-line paste of slash commands: each line that starts with `/`
+        // gets run in sequence. Empty lines are skipped. Non-slash lines
+        // inside a multi-line block are ignored (we don't try to mix them
+        // with a normal chat send — too ambiguous). This is what the user
+        // expects when they paste 3-4 commands at once.
         if (text.startsWith('/')) {
+          const slashLines = text.split('\n')
+            .map(l => l.trim())
+            .filter(l => l.startsWith('/'));
+          if (slashLines.length > 1) {
+            $('composer').value = '';
+            autoSize($('composer'));
+            for (const line of slashLines) {
+              await handleSlashCommandExecution(line);
+            }
+            return;
+          }
           if (await handleSlashCommandExecution(text)) {
             $('composer').value = '';
             autoSize($('composer'));
@@ -4500,7 +4517,11 @@
                 note(`Created empty KB \`${name}\`. Ingest a folder with \`/kb ingest ${name} /path\`.`);
               } else if (sub === 'ingest') {
                 const name = tokens[1];
-                const path = tokens.slice(2).join(' ');
+                // Path: take everything after `ingest NAME ` up to the first
+                // newline. This way paths with spaces still work, but a
+                // multi-line paste with extra commands doesn't get sucked in.
+                const afterName = (args || '').replace(/^\s*ingest\s+\S+\s+/, '');
+                const path = afterName.split('\n')[0].trim();
                 if (!name || !path) { toast('Usage: /kb ingest <name> <path>'); break; }
                 const loadingMsg = { role: 'system', content: `*Embedding \`${path}\` into \`${name}\`… (chunks via nomic-embed-text)*`, ts: Date.now() };
                 c.messages.push(loadingMsg);
@@ -4530,14 +4551,21 @@
           }
 
           case '/ask': {
-            if (!args) { toast('Usage: /ask [-kb <name>] <question>'); break; }
+            if (!args) { toast('Usage: /ask [-kb <name>] [-model <model>] <question>'); break; }
             if (!state.adminToken) { toast('Admin login required'); break; }
 
-            // Parse optional -kb flag; remainder is the question.
+            // Parse optional `-kb NAME` and `-model NAME` flags in any order;
+            // remainder is the question.
             let kbName = '';
+            let askModel = '';
             let rest = args.trim();
-            const m = rest.match(/^-kb\s+(\S+)\s+(.*)$/);
-            if (m) { kbName = m[1]; rest = m[2]; }
+            while (true) {
+              const m1 = rest.match(/^-kb\s+(\S+)\s+(.*)$/);
+              if (m1) { kbName = m1[1]; rest = m1[2]; continue; }
+              const m2 = rest.match(/^(?:-m|-model|--model)\s+(\S+)\s+(.*)$/);
+              if (m2) { askModel = m2[1]; rest = m2[2]; continue; }
+              break;
+            }
             // If no -kb given, ask the user to pick from /kb list
             if (!kbName) {
               try {
@@ -4581,6 +4609,7 @@
             await streamFromEndpoint('/api/ask', {
               kb: kbName,
               query: question,
+              model: askModel || undefined,
             }, c, asst, contentEl, cursor, 'Retrieving + answering…');
             break;
           }
@@ -4614,29 +4643,46 @@
                   break;
                 }
                 let md = `## Schedules (${data.schedules.length})\n\n`;
-                md += '| ID | Name | When | Recipe | Enabled | Last run | Next run |\n|---:|---|---|---|---:|---|---|\n';
+                md += '| ID | Name | When | Recipe | Email | Enabled | Last run | Next run |\n|---:|---|---|---|---|---:|---|---|\n';
                 for (const s of data.schedules) {
-                  md += `| ${s.id} | **${s.name}** | \`${s.when}\` | ${s.recipe}${s.recipe_args ? ' ' + s.recipe_args : ''} | ${s.enabled ? '✓' : '✗'} | ${fmtTs(s.last_run_ts)} | ${fmtTs(s.next_run_ts)} |\n`;
+                  md += `| ${s.id} | **${s.name}** | \`${s.when}\` | ${s.recipe}${s.recipe_args ? ' ' + s.recipe_args : ''} | ${s.email_to ? '✉ ' + s.email_to : '—'} | ${s.enabled ? '✓' : '✗'} | ${fmtTs(s.last_run_ts)} | ${fmtTs(s.next_run_ts)} |\n`;
                 }
+                md += `\n**Recipes:** ${(data.recipes || []).map(r => `\`${r}\``).join(', ')}\n`;
                 md += '\nManage: `/schedule run ID`, `/schedule view ID`, `/schedule on|off ID`, `/schedule delete ID`.';
                 note(md);
               } else if (sub === 'add') {
-                // /schedule add NAME "when" recipe [args...]
-                // Parse: take name, then quoted-or-single-token when, then recipe + rest.
-                const m = (args || '').match(/^add\s+(\S+)\s+"([^"]+)"\s+(\S+)\s*(.*)$/) ||
-                          (args || '').match(/^add\s+(\S+)\s+(\S+\s+\S+)\s+(\S+)\s*(.*)$/);
+                // /schedule add NAME "when" recipe [args...] [-email addr]
+                //
+                // Parse: split off "-email <addr>" anywhere (before or after
+                // recipe args), then match NAME "WHEN" RECIPE [args] on the
+                // remainder. The when can be quoted ("weekday 07:30") or two
+                // bare tokens (weekday 07:30 → consumed greedily as two).
+                let rest = (args || '').trim();
+                let emailTo = '';
+                const emailM = rest.match(/(.*?)\s+-email\s+(\S+)\s*(.*)/);
+                if (emailM) {
+                  emailTo = emailM[2];
+                  rest = (emailM[1] + ' ' + emailM[3]).trim();
+                }
+                const m = rest.match(/^add\s+(\S+)\s+"([^"]+)"\s+(\S+)\s*(.*)$/) ||
+                          rest.match(/^add\s+(\S+)\s+(\S+\s+\S+)\s+(\S+)\s*(.*)$/);
                 if (!m) {
-                  toast('Usage: /schedule add NAME "WHEN" RECIPE [args]  — e.g. /schedule add brief "weekday 07:30" portfolio');
+                  toast('Usage: /schedule add NAME "WHEN" RECIPE [args] [-email addr]  — e.g. /schedule add brief "weekday 07:30" morning_brief NVDA,AAPL -email me@example.com');
                   break;
                 }
                 const [, name, when_, recipe, recipe_args] = m;
                 const r = await fetch('/api/schedules', {
                   method: 'POST', headers: auth,
-                  body: JSON.stringify({ name, when: when_, recipe, recipe_args: recipe_args || '' }),
+                  body: JSON.stringify({
+                    name, when: when_, recipe,
+                    recipe_args: recipe_args || '',
+                    email_to: emailTo || undefined,
+                  }),
                 });
                 if (!r.ok) throw new Error(await r.text());
                 const data = await r.json();
-                note(`Added schedule **#${data.id}** \`${name}\` — next run: ${fmtTs(data.next_run_ts)}.`);
+                note(`Added schedule **#${data.id}** \`${name}\` — next run: ${fmtTs(data.next_run_ts)}` +
+                     (data.email_to ? ` · will email **${data.email_to}**` : '') + '.');
               } else if (sub === 'run') {
                 const id = parseInt(tokens[1], 10);
                 if (!id) { toast('Usage: /schedule run ID'); break; }
