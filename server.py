@@ -2289,6 +2289,901 @@ async def history_clear(req: Request) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# RAG knowledge bases (/api/kb/* and /api/ask)
+#
+# Drop a folder of docs into a named knowledge base; we chunk, embed
+# (nomic-embed-text via Ollama), and store. /api/ask retrieves the most
+# relevant chunks and streams a cited answer through whatever chat model
+# you specify (or the search default).
+#
+# Storage: one SQLite DB at data/kb.db with two tables. Embeddings are
+# stored as raw float32 BLOBs and similarity is brute-force NumPy cosine
+# (fast enough for <100k chunks — well past personal-knowledge-base size).
+# No external vector store dependency.
+# ---------------------------------------------------------------------------
+
+KB_DB_PATH = Path(os.getenv("KB_DB_PATH", str(DATA_DIR / "kb.db")))
+KB_EMBED_MODEL = os.getenv("KB_EMBED_MODEL", "nomic-embed-text")
+KB_CHUNK_CHARS = int(os.getenv("KB_CHUNK_CHARS", "1000"))
+KB_CHUNK_OVERLAP = int(os.getenv("KB_CHUNK_OVERLAP", "150"))
+KB_DEFAULT_TOP_K = int(os.getenv("KB_DEFAULT_TOP_K", "6"))
+KB_MAX_DOC_CHARS = int(os.getenv("KB_MAX_DOC_CHARS", "2000000"))  # 2 MB per doc
+
+# File extensions we know how to ingest as text. PDFs go through pypdf;
+# HTML goes through trafilatura; everything else is read as UTF-8.
+KB_TEXT_EXTS = {
+    ".txt", ".md", ".rst", ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx",
+    ".java", ".go", ".rs", ".c", ".h", ".cc", ".cpp", ".cs", ".rb", ".php",
+    ".swift", ".kt", ".sh", ".bash", ".zsh", ".sql", ".yaml", ".yml",
+    ".toml", ".ini", ".json", ".xml", ".csv", ".log", ".tex", ".org",
+}
+KB_PDF_EXTS = {".pdf"}
+KB_HTML_EXTS = {".html", ".htm"}
+KB_SKIP_DIRS = {".git", "node_modules", "__pycache__", ".venv", "venv",
+                ".pytest_cache", ".idea", ".vscode", "dist", "build", "target"}
+
+
+def _kb_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(KB_DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS kb (
+            name TEXT PRIMARY KEY,
+            created_at INTEGER NOT NULL,
+            embed_model TEXT NOT NULL,
+            doc_count INTEGER DEFAULT 0,
+            chunk_count INTEGER DEFAULT 0
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS kb_chunk (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            kb_name TEXT NOT NULL,
+            doc_path TEXT NOT NULL,
+            chunk_index INTEGER NOT NULL,
+            text TEXT NOT NULL,
+            embedding BLOB NOT NULL,
+            ts INTEGER NOT NULL,
+            FOREIGN KEY (kb_name) REFERENCES kb(name)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_kbchunk_name ON kb_chunk(kb_name)")
+    return conn
+
+
+def _kb_chunk_text(text: str,
+                   target: int = KB_CHUNK_CHARS,
+                   overlap: int = KB_CHUNK_OVERLAP) -> list[str]:
+    """Paragraph-aware chunker. Tries to keep chunks <= target chars while
+    not splitting paragraphs unless they themselves are too long. Adds an
+    overlap from the previous chunk's tail to preserve cross-chunk context."""
+    text = (text or "").strip()
+    if not text:
+        return []
+    paragraphs = re.split(r"\n\s*\n+", text)
+    chunks: list[str] = []
+    cur = ""
+    for p in paragraphs:
+        p = p.strip()
+        if not p:
+            continue
+        if len(p) > target:
+            # Long paragraph — fall back to sentence-ish splitting.
+            for sent in re.split(r"(?<=[.!?])\s+", p):
+                if len(cur) + len(sent) + 1 <= target:
+                    cur = (cur + " " + sent).strip() if cur else sent
+                else:
+                    if cur:
+                        chunks.append(cur)
+                    cur = sent
+        else:
+            if len(cur) + len(p) + 2 <= target:
+                cur = (cur + "\n\n" + p) if cur else p
+            else:
+                if cur:
+                    chunks.append(cur)
+                cur = p
+    if cur:
+        chunks.append(cur)
+
+    if overlap <= 0 or len(chunks) < 2:
+        return chunks
+    out: list[str] = [chunks[0]]
+    for i in range(1, len(chunks)):
+        prev_tail = chunks[i - 1][-overlap:]
+        out.append(prev_tail + "\n\n" + chunks[i])
+    return out
+
+
+def _kb_read_file(path: Path) -> str:
+    """Best-effort read of a single file to text. Returns "" on failure."""
+    suffix = path.suffix.lower()
+    try:
+        raw_bytes = path.read_bytes()
+    except OSError:
+        return ""
+    if len(raw_bytes) > KB_MAX_DOC_CHARS:
+        # Truncate but keep something — bigger files than this are usually
+        # not what the user meant to add.
+        raw_bytes = raw_bytes[:KB_MAX_DOC_CHARS]
+    if suffix in KB_PDF_EXTS:
+        try:
+            from pypdf import PdfReader
+            reader = PdfReader(io.BytesIO(raw_bytes))
+            pages = []
+            for i, page in enumerate(reader.pages):
+                if i >= MAX_PDF_PAGES:
+                    break
+                try:
+                    pages.append(page.extract_text() or "")
+                except Exception:
+                    pass
+            return "\n\n".join(pages)
+        except Exception:
+            return ""
+    if suffix in KB_HTML_EXTS:
+        try:
+            return _extract_main_text(raw_bytes.decode("utf-8", errors="replace"))
+        except Exception:
+            return ""
+    if suffix in KB_TEXT_EXTS or suffix == "":
+        try:
+            return raw_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            return raw_bytes.decode("latin-1", errors="replace")
+    return ""
+
+
+def _kb_walk(root: Path) -> list[Path]:
+    """Return the list of files to ingest from `root` (file or directory)."""
+    if root.is_file():
+        return [root]
+    if not root.is_dir():
+        return []
+    out: list[Path] = []
+    for cur, dirs, names in os.walk(root):
+        dirs[:] = [d for d in dirs if d not in KB_SKIP_DIRS and not d.startswith(".")]
+        for n in names:
+            p = Path(cur) / n
+            suffix = p.suffix.lower()
+            if suffix in KB_TEXT_EXTS or suffix in KB_PDF_EXTS or suffix in KB_HTML_EXTS:
+                out.append(p)
+    return out
+
+
+async def _ollama_embed(texts: list[str]) -> list[list[float]]:
+    """Batch-embed texts via Ollama's /api/embed endpoint."""
+    if not texts:
+        return []
+    timeout = httpx.Timeout(connect=10.0, read=180.0, write=30.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as cli:
+        # Ollama's /api/embed accepts batched input; if the model server is
+        # older and only knows /api/embeddings, fall back per-text.
+        r = await cli.post(
+            f"{OLLAMA_URL}/api/embed",
+            json={"model": KB_EMBED_MODEL, "input": texts},
+        )
+        if r.status_code == 404:
+            out: list[list[float]] = []
+            for t in texts:
+                r2 = await cli.post(
+                    f"{OLLAMA_URL}/api/embeddings",
+                    json={"model": KB_EMBED_MODEL, "prompt": t},
+                )
+                r2.raise_for_status()
+                out.append(r2.json()["embedding"])
+            return out
+        r.raise_for_status()
+        data = r.json()
+        return data.get("embeddings") or [data.get("embedding")]
+
+
+def _vec_blob(v: list[float]) -> bytes:
+    import numpy as np
+    return np.asarray(v, dtype=np.float32).tobytes()
+
+
+def _kb_search_local(kb_name: str, query_vec: list[float], k: int) -> list[dict]:
+    """Brute-force cosine top-k. Linear in chunk count — fast enough."""
+    import numpy as np
+    conn = _kb_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, doc_path, chunk_index, text, embedding "
+            "FROM kb_chunk WHERE kb_name = ?", (kb_name,),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return []
+    embs = np.stack([np.frombuffer(r[4], dtype=np.float32) for r in rows])
+    q = np.asarray(query_vec, dtype=np.float32)
+    qn = q / (np.linalg.norm(q) + 1e-9)
+    en = embs / (np.linalg.norm(embs, axis=1, keepdims=True) + 1e-9)
+    scores = en @ qn
+    order = np.argsort(-scores)[:k]
+    return [
+        {"id": int(rows[i][0]), "doc_path": rows[i][1],
+         "chunk_index": int(rows[i][2]), "text": rows[i][3],
+         "score": float(scores[i])}
+        for i in order
+    ]
+
+
+@app.get("/api/kb/list")
+async def kb_list(req: Request) -> dict[str, Any]:
+    _check_auth(req)
+    def _do():
+        conn = _kb_conn()
+        try:
+            rows = conn.execute(
+                "SELECT name, created_at, embed_model, doc_count, chunk_count "
+                "FROM kb ORDER BY name"
+            ).fetchall()
+            return {"kbs": [
+                {"name": r[0], "created_at": r[1], "embed_model": r[2],
+                 "doc_count": r[3], "chunk_count": r[4]}
+                for r in rows
+            ]}
+        finally:
+            conn.close()
+    return await asyncio.to_thread(_do)
+
+
+@app.post("/api/kb/create")
+async def kb_create(req: Request) -> dict[str, Any]:
+    _check_auth(req)
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+    name = (body.get("name") or "").strip()
+    if not name or not re.match(r"^[A-Za-z0-9_.-]+$", name):
+        raise HTTPException(400, "Name must be alphanumeric, dot, dash, underscore")
+    def _do():
+        conn = _kb_conn()
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO kb (name, created_at, embed_model) VALUES (?, ?, ?)",
+                (name, int(time.time() * 1000), KB_EMBED_MODEL),
+            )
+            conn.commit()
+            return {"name": name}
+        finally:
+            conn.close()
+    return await asyncio.to_thread(_do)
+
+
+@app.post("/api/kb/ingest")
+async def kb_ingest(req: Request) -> dict[str, Any]:
+    """Ingest a local path (file or directory) into a KB. Creates the KB
+    if it doesn't already exist."""
+    _check_auth(req)
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+    name = (body.get("name") or "").strip()
+    path = (body.get("path") or "").strip()
+    if not name or not path:
+        raise HTTPException(400, "Need both 'name' and 'path'")
+    if not re.match(r"^[A-Za-z0-9_.-]+$", name):
+        raise HTTPException(400, "KB name must be alphanumeric, dot, dash, underscore")
+    root = Path(path).expanduser()
+    if not root.exists():
+        raise HTTPException(404, f"Path not found: {root}")
+
+    # Collect files first so we can give a useful progress estimate
+    files = await asyncio.to_thread(_kb_walk, root)
+    if not files:
+        raise HTTPException(400, f"No ingestable files found under {root}")
+
+    # Read + chunk in a thread, then embed in async batches.
+    def _build_chunks() -> list[tuple[str, int, str]]:
+        out: list[tuple[str, int, str]] = []
+        for f in files:
+            text = _kb_read_file(f)
+            if not text.strip():
+                continue
+            chunks = _kb_chunk_text(text)
+            for i, c in enumerate(chunks):
+                out.append((str(f), i, c))
+        return out
+
+    triples = await asyncio.to_thread(_build_chunks)
+    if not triples:
+        raise HTTPException(400, "No ingestable text extracted")
+
+    log.info("kb_ingest: %s ← %d files → %d chunks", name, len(files), len(triples))
+
+    # Embed in batches of 32 to keep Ollama happy.
+    BATCH = 32
+    all_vecs: list[list[float]] = []
+    for i in range(0, len(triples), BATCH):
+        batch_text = [t[2] for t in triples[i:i + BATCH]]
+        try:
+            vecs = await _ollama_embed(batch_text)
+        except httpx.HTTPError as e:
+            raise HTTPException(502, f"Ollama embedding failed: {e}")
+        all_vecs.extend(vecs)
+    assert len(all_vecs) == len(triples), "embedding count mismatch"
+
+    def _persist():
+        conn = _kb_conn()
+        try:
+            conn.execute(
+                "INSERT OR IGNORE INTO kb (name, created_at, embed_model) VALUES (?, ?, ?)",
+                (name, int(time.time() * 1000), KB_EMBED_MODEL),
+            )
+            now = int(time.time() * 1000)
+            rows = []
+            for (doc_path, idx, text), vec in zip(triples, all_vecs):
+                rows.append((name, doc_path, idx, text, _vec_blob(vec), now))
+            conn.executemany(
+                "INSERT INTO kb_chunk (kb_name, doc_path, chunk_index, text, embedding, ts) "
+                "VALUES (?, ?, ?, ?, ?, ?)", rows,
+            )
+            # Update aggregate stats
+            chunk_count = conn.execute(
+                "SELECT COUNT(*) FROM kb_chunk WHERE kb_name = ?", (name,)
+            ).fetchone()[0]
+            doc_count = conn.execute(
+                "SELECT COUNT(DISTINCT doc_path) FROM kb_chunk WHERE kb_name = ?", (name,)
+            ).fetchone()[0]
+            conn.execute(
+                "UPDATE kb SET doc_count = ?, chunk_count = ? WHERE name = ?",
+                (doc_count, chunk_count, name),
+            )
+            conn.commit()
+            return {"chunks": chunk_count, "docs": doc_count}
+        finally:
+            conn.close()
+
+    stats = await asyncio.to_thread(_persist)
+    return {
+        "name": name,
+        "files_seen": len(files),
+        "chunks_added": len(triples),
+        "kb_total_chunks": stats["chunks"],
+        "kb_total_docs": stats["docs"],
+    }
+
+
+@app.delete("/api/kb/{name}")
+async def kb_delete(name: str, req: Request) -> dict[str, Any]:
+    _check_auth(req)
+    if not re.match(r"^[A-Za-z0-9_.-]+$", name):
+        raise HTTPException(400, "Invalid KB name")
+    def _do():
+        conn = _kb_conn()
+        try:
+            conn.execute("DELETE FROM kb_chunk WHERE kb_name = ?", (name,))
+            conn.execute("DELETE FROM kb WHERE name = ?", (name,))
+            conn.commit()
+            return {"deleted": name}
+        finally:
+            conn.close()
+    return await asyncio.to_thread(_do)
+
+
+@app.post("/api/kb/search")
+async def kb_search(req: Request) -> dict[str, Any]:
+    """Pure semantic search — no LLM. Useful for debugging retrieval."""
+    _check_auth(req)
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+    kb_name = (body.get("name") or "").strip()
+    query = (body.get("query") or "").strip()
+    k = max(1, min(int(body.get("k") or KB_DEFAULT_TOP_K), 50))
+    if not kb_name or not query:
+        raise HTTPException(400, "Need both 'name' and 'query'")
+    try:
+        qvec = (await _ollama_embed([query]))[0]
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Ollama embedding failed: {e}")
+    hits = await asyncio.to_thread(_kb_search_local, kb_name, qvec, k)
+    return {"kb": kb_name, "query": query, "hits": hits}
+
+
+@app.post("/api/ask")
+async def ask(req: Request) -> StreamingResponse:
+    """RAG-grounded streaming answer. Searches a KB, builds a cited prompt,
+    streams the response in the same NDJSON shape as /api/chat."""
+    _check_auth(req)
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+    kb_name = (body.get("kb") or body.get("name") or "").strip()
+    query = (body.get("query") or body.get("question") or "").strip()
+    if not kb_name or not query:
+        raise HTTPException(400, "Need both 'kb' and 'query'")
+    k = max(1, min(int(body.get("k") or KB_DEFAULT_TOP_K), 20))
+    model = (body.get("model") or "").strip() or os.getenv("SEARCH_DEFAULT_MODEL", "llama3.3")
+    try:
+        temperature = float(body.get("temperature", 0.2))
+    except (TypeError, ValueError):
+        temperature = 0.2
+
+    try:
+        qvec = (await _ollama_embed([query]))[0]
+    except httpx.HTTPError as e:
+        raise HTTPException(502, f"Ollama embedding failed: {e}")
+    hits = await asyncio.to_thread(_kb_search_local, kb_name, qvec, k)
+    if not hits:
+        raise HTTPException(404, f"No content found in KB {kb_name!r}")
+
+    log.info("ask: kb=%s query=%r k=%d model=%s top_score=%.3f",
+             kb_name, query[:60], k, model, hits[0]["score"])
+
+    system = (
+        "You are a research assistant answering questions over a personal "
+        "knowledge base. Use ONLY the excerpts below. Cite every claim with "
+        "[N] matching the excerpt list. If the answer isn't in the excerpts, "
+        "say so plainly — do not invent facts. End with a 'Sources:' section "
+        "listing [N] doc_path for every excerpt you cited."
+    )
+    parts = [f"# Question\n{query}\n\n# Excerpts"]
+    for i, h in enumerate(hits, 1):
+        parts.append(f"\n[{i}] `{h['doc_path']}` · chunk {h['chunk_index']} · "
+                     f"similarity {h['score']:.3f}\n{h['text']}\n")
+    user_prompt = "\n".join(parts)
+
+    preview_lines = "\n".join(
+        f"  [{i + 1}] `{h['doc_path']}` · chunk {h['chunk_index']} · sim {h['score']:.3f}"
+        for i, h in enumerate(hits)
+    )
+    preamble = (
+        f"_Asking **{kb_name}** with `{model}` · {len(hits)} excerpts retrieved._\n\n"
+        f"<details><summary>Retrieved chunks (top {len(hits)})</summary>\n\n"
+        f"{preview_lines}\n\n</details>\n\n"
+    )
+
+    return StreamingResponse(
+        _stream_ollama_chat(model, system, user_prompt, temperature, preamble),
+        media_type="application/x-ndjson",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# Scheduled tasks (/api/schedules/*)
+#
+# A small in-process scheduler. No external dep (no APScheduler) — an
+# asyncio background task that ticks every 30s, picks up due jobs, and
+# runs a built-in "recipe" by calling the existing endpoints internally.
+#
+# Two SQLite tables: schedules (the rules) and task_runs (the log).
+# Schedule syntax is intentionally narrow (so we don't need a cron parser):
+#   "daily HH:MM"          — every day at HH:MM local time
+#   "weekday HH:MM"        — Mon–Fri at HH:MM
+#   "weekend HH:MM"        — Sat/Sun at HH:MM
+#   "every Nm"             — every N minutes
+#   "every Nh"             — every N hours
+#
+# Built-in recipes (all read-only):
+#   portfolio              — Alpaca account dump
+#   watchlist              — quote everything in state.watchlist
+#   stock TICKER           — single-ticker dashboard
+#   ask KB QUERY           — RAG query against a KB
+#   search QUERY           — SearXNG-grounded answer
+# ---------------------------------------------------------------------------
+
+SCHEDULE_DB_PATH = Path(os.getenv("SCHEDULE_DB_PATH", str(DATA_DIR / "schedules.db")))
+SCHEDULE_TICK_S = int(os.getenv("SCHEDULE_TICK_S", "30"))
+
+
+def _schedule_conn() -> sqlite3.Connection:
+    conn = sqlite3.connect(SCHEDULE_DB_PATH)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS schedules (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            when_spec TEXT NOT NULL,
+            recipe TEXT NOT NULL,
+            recipe_args TEXT,
+            enabled INTEGER DEFAULT 1,
+            last_run_ts INTEGER,
+            next_run_ts INTEGER,
+            created_at INTEGER NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS task_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            schedule_id INTEGER NOT NULL,
+            started_at INTEGER NOT NULL,
+            finished_at INTEGER,
+            ok INTEGER,
+            output TEXT,
+            FOREIGN KEY (schedule_id) REFERENCES schedules(id)
+        )
+    """)
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_taskruns_sched ON task_runs(schedule_id, started_at DESC)")
+    return conn
+
+
+def _next_run_after(spec: str, now_ts_s: float) -> float | None:
+    """Compute the next epoch-second timestamp matching `spec`, > now_ts_s.
+
+    Returns None if the spec is unparseable.
+    """
+    import datetime as dt
+    spec = spec.strip().lower()
+    now = dt.datetime.fromtimestamp(now_ts_s)
+
+    m = re.match(r"^every\s+(\d+)\s*([mh])$", spec)
+    if m:
+        n = int(m.group(1))
+        unit_s = 60 if m.group(2) == "m" else 3600
+        return now_ts_s + n * unit_s
+
+    m = re.match(r"^(daily|weekday|weekend)\s+(\d{1,2}):(\d{2})$", spec)
+    if m:
+        kind, hh, mm = m.group(1), int(m.group(2)), int(m.group(3))
+        if not (0 <= hh < 24 and 0 <= mm < 60):
+            return None
+        target = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+        if target <= now:
+            target += dt.timedelta(days=1)
+        # Step forward until the weekday matches the kind
+        for _ in range(7):
+            wd = target.weekday()   # 0=Mon … 6=Sun
+            if kind == "daily":
+                return target.timestamp()
+            if kind == "weekday" and wd < 5:
+                return target.timestamp()
+            if kind == "weekend" and wd >= 5:
+                return target.timestamp()
+            target += dt.timedelta(days=1)
+        return None
+    return None
+
+
+# ---- Built-in recipes ------------------------------------------------------
+# Each recipe returns a markdown string. Recipes call internal helpers
+# directly rather than going through HTTP to avoid auth round-tripping.
+
+async def _recipe_portfolio(args: str) -> str:
+    tc = _alpaca_trading_client()
+    if tc is None:
+        return "_Alpaca trading client not configured (no APCA keys)._"
+    def _do():
+        acc = tc.get_account()
+        positions = tc.get_all_positions()
+        return acc, positions
+    acc, positions = await asyncio.to_thread(_do)
+    def _f(x):
+        try:
+            return float(x)
+        except (TypeError, ValueError):
+            return None
+    equity = _f(acc.equity)
+    last_eq = _f(acc.last_equity)
+    day_pl = (equity - last_eq) if equity is not None and last_eq is not None else None
+    day_pct = (day_pl / last_eq * 100) if (day_pl is not None and last_eq) else None
+    arrow = "▲" if (day_pl or 0) >= 0 else "▼"
+    out = [f"## Portfolio brief\n"]
+    out.append(f"**${equity:,.2f}** equity · {arrow} ${abs(day_pl):,.2f} ({day_pct:+.2f}%) today  ")
+    out.append(f"Cash ${_f(acc.cash):,.2f} · Buying power ${_f(acc.buying_power):,.2f}\n")
+    if positions:
+        out.append("| Symbol | Qty | Mkt Value | Day P&L |\n|---|---:|---:|---:|")
+        for p in sorted(positions, key=lambda p: -abs(_f(p.market_value) or 0)):
+            dpl = _f(p.unrealized_intraday_pl)
+            out.append(f"| **{p.symbol}** | {_f(p.qty):g} | ${_f(p.market_value):,.0f} | "
+                       f"{('+' if (dpl or 0) >= 0 else '')}${dpl:,.2f} |")
+    else:
+        out.append("_No open positions._")
+    return "\n".join(out)
+
+
+async def _recipe_watchlist(args: str) -> str:
+    """args is the watchlist itself as a JSON list of tickers, or comma-separated."""
+    tickers: list[str]
+    args = (args or "").strip()
+    if args.startswith("["):
+        try:
+            tickers = [t.upper() for t in json.loads(args)]
+        except Exception:
+            tickers = []
+    else:
+        tickers = [t.strip().upper() for t in args.split(",") if t.strip()]
+    if not tickers:
+        return "_No tickers configured for watchlist recipe._"
+    rows = []
+    async def _one(t: str):
+        try:
+            quote = await asyncio.to_thread(_alpaca_quote_and_bars, t, 5) \
+                    or await asyncio.to_thread(_yf_company_info, t)
+            if not quote or "price" not in quote:
+                return f"| **{t}** | err | – | – |"
+            arrow = "▲" if quote["change"] >= 0 else "▼"
+            return (f"| **{t}** | ${quote['price']:,.2f} | "
+                    f"{arrow} ${abs(quote['change']):,.2f} | "
+                    f"{quote['change_pct']:+.2f}% |")
+        except Exception as e:
+            return f"| **{t}** | err | – | _{e.__class__.__name__}_ |"
+    rows = await asyncio.gather(*[_one(t) for t in tickers])
+    return ("## Watchlist brief\n\n| Ticker | Price | Change | Today |\n"
+            "|---|---:|---:|---:|\n" + "\n".join(rows))
+
+
+async def _recipe_stock(args: str) -> str:
+    t = (args or "").strip().upper()
+    if not t:
+        return "_recipe `stock` requires a ticker argument._"
+    quote = await asyncio.to_thread(_alpaca_quote_and_bars, t, 30)
+    info = await asyncio.to_thread(_yf_company_info, t)
+    if not quote:
+        return f"_No price data for {t}._"
+    name = info.get("name") or t
+    arrow = "▲" if quote["change"] >= 0 else "▼"
+    return (f"## {name} ({t})\n\n"
+            f"${quote['price']:,.2f} · {arrow} ${abs(quote['change']):,.2f} "
+            f"({quote['change_pct']:+.2f}%)\n")
+
+
+async def _recipe_ask(args: str) -> str:
+    """args: "kb_name|question". Runs a non-streaming RAG query."""
+    parts = (args or "").split("|", 1)
+    if len(parts) != 2:
+        return "_recipe `ask` needs args of the form `kb_name|question`._"
+    kb_name, question = parts[0].strip(), parts[1].strip()
+    if not kb_name or not question:
+        return "_recipe `ask` needs both kb_name and question._"
+    try:
+        qvec = (await _ollama_embed([question]))[0]
+    except Exception as e:
+        return f"_Embedding failed: {e}_"
+    hits = await asyncio.to_thread(_kb_search_local, kb_name, qvec, KB_DEFAULT_TOP_K)
+    if not hits:
+        return f"_No content in KB `{kb_name}` for that query._"
+    model = os.getenv("SEARCH_DEFAULT_MODEL", "llama3.3")
+    system = (
+        "Answer using only the excerpts. Cite [N]. If unanswerable from the "
+        "excerpts, say so. End with a 'Sources:' line."
+    )
+    user = f"# Q\n{question}\n\n# Excerpts\n" + "\n\n".join(
+        f"[{i+1}] {h['text']}" for i, h in enumerate(hits)
+    )
+    upstream = json.dumps({
+        "model": model,
+        "messages": [{"role": "system", "content": system},
+                     {"role": "user", "content": user}],
+        "stream": False,
+        "options": {"temperature": 0.2},
+    }).encode()
+    async with httpx.AsyncClient(timeout=httpx.Timeout(connect=10, read=120, write=10, pool=10)) as c:
+        r = await c.post(f"{OLLAMA_URL}/api/chat", content=upstream,
+                         headers={"content-type": "application/json"})
+    if r.status_code != 200:
+        return f"_Ollama returned {r.status_code}_"
+    data = r.json()
+    return f"## Ask `{kb_name}` — {question}\n\n{data.get('message', {}).get('content', '')}"
+
+
+RECIPES = {
+    "portfolio": _recipe_portfolio,
+    "watchlist": _recipe_watchlist,
+    "stock": _recipe_stock,
+    "ask": _recipe_ask,
+}
+
+
+async def _run_schedule_now(sched_row: tuple) -> int:
+    """Execute a scheduled task once and append a row to task_runs.
+    Returns the task_run id."""
+    sched_id, name, when_spec, recipe, recipe_args, *_ = sched_row
+    fn = RECIPES.get(recipe)
+    started = int(time.time() * 1000)
+    log.info("schedule: running id=%d name=%r recipe=%r", sched_id, name, recipe)
+    try:
+        if fn is None:
+            output = f"_Unknown recipe `{recipe}`._"
+            ok = 0
+        else:
+            output = await fn(recipe_args or "")
+            ok = 1
+    except Exception as e:
+        log.exception("scheduled task failed")
+        output = f"_Task failed: {e.__class__.__name__}: {e}_"
+        ok = 0
+    finished = int(time.time() * 1000)
+    def _persist():
+        conn = _schedule_conn()
+        try:
+            cur = conn.execute(
+                "INSERT INTO task_runs (schedule_id, started_at, finished_at, ok, output) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (sched_id, started, finished, ok, output),
+            )
+            # Compute next_run_ts based on current spec
+            next_ts = _next_run_after(when_spec, time.time())
+            conn.execute(
+                "UPDATE schedules SET last_run_ts = ?, next_run_ts = ? WHERE id = ?",
+                (finished, int(next_ts * 1000) if next_ts else None, sched_id),
+            )
+            conn.commit()
+            return cur.lastrowid
+        finally:
+            conn.close()
+    return await asyncio.to_thread(_persist)
+
+
+async def _scheduler_loop():
+    """Background loop. Ticks every SCHEDULE_TICK_S, picks up due tasks."""
+    await asyncio.sleep(5)   # give the server a moment to finish startup
+    log.info("scheduler: started, tick=%ds", SCHEDULE_TICK_S)
+    while True:
+        try:
+            now_ms = int(time.time() * 1000)
+            def _due():
+                conn = _schedule_conn()
+                try:
+                    rows = conn.execute(
+                        "SELECT id, name, when_spec, recipe, recipe_args, enabled, last_run_ts, next_run_ts "
+                        "FROM schedules WHERE enabled = 1 AND next_run_ts IS NOT NULL AND next_run_ts <= ?",
+                        (now_ms,),
+                    ).fetchall()
+                    return rows
+                finally:
+                    conn.close()
+            due = await asyncio.to_thread(_due)
+            for row in due:
+                try:
+                    await _run_schedule_now(row)
+                except Exception:
+                    log.exception("scheduler: task crashed")
+        except Exception:
+            log.exception("scheduler tick failed")
+        await asyncio.sleep(SCHEDULE_TICK_S)
+
+
+@app.on_event("startup")
+async def _start_scheduler() -> None:
+    asyncio.create_task(_scheduler_loop())
+
+
+@app.get("/api/schedules")
+async def schedules_list(req: Request) -> dict[str, Any]:
+    _check_auth(req)
+    def _do():
+        conn = _schedule_conn()
+        try:
+            rows = conn.execute(
+                "SELECT id, name, when_spec, recipe, recipe_args, enabled, "
+                "       last_run_ts, next_run_ts, created_at "
+                "FROM schedules ORDER BY id DESC"
+            ).fetchall()
+            return {"schedules": [
+                {"id": r[0], "name": r[1], "when": r[2], "recipe": r[3],
+                 "recipe_args": r[4], "enabled": bool(r[5]),
+                 "last_run_ts": r[6], "next_run_ts": r[7], "created_at": r[8]}
+                for r in rows
+            ]}
+        finally:
+            conn.close()
+    return await asyncio.to_thread(_do)
+
+
+@app.post("/api/schedules")
+async def schedules_create(req: Request) -> dict[str, Any]:
+    _check_auth(req)
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON")
+    name = (body.get("name") or "").strip()
+    when_spec = (body.get("when") or "").strip()
+    recipe = (body.get("recipe") or "").strip().lower()
+    recipe_args = (body.get("recipe_args") or "").strip()
+    if not name or not when_spec or not recipe:
+        raise HTTPException(400, "Need name, when, and recipe")
+    if recipe not in RECIPES:
+        raise HTTPException(400, f"Unknown recipe {recipe!r}. Pick from: {sorted(RECIPES)}")
+    next_ts = _next_run_after(when_spec, time.time())
+    if next_ts is None:
+        raise HTTPException(400, f"Unparseable when={when_spec!r}. Examples: "
+                                  "'daily 07:30', 'weekday 09:00', 'every 30m', 'every 4h'.")
+    def _do():
+        conn = _schedule_conn()
+        try:
+            cur = conn.execute(
+                "INSERT INTO schedules (name, when_spec, recipe, recipe_args, "
+                "                       enabled, next_run_ts, created_at) "
+                "VALUES (?, ?, ?, ?, 1, ?, ?)",
+                (name, when_spec, recipe, recipe_args,
+                 int(next_ts * 1000), int(time.time() * 1000)),
+            )
+            conn.commit()
+            return {"id": cur.lastrowid, "next_run_ts": int(next_ts * 1000)}
+        finally:
+            conn.close()
+    return await asyncio.to_thread(_do)
+
+
+@app.delete("/api/schedules/{sched_id}")
+async def schedules_delete(sched_id: int, req: Request) -> dict[str, Any]:
+    _check_auth(req)
+    def _do():
+        conn = _schedule_conn()
+        try:
+            conn.execute("DELETE FROM task_runs WHERE schedule_id = ?", (sched_id,))
+            conn.execute("DELETE FROM schedules WHERE id = ?", (sched_id,))
+            conn.commit()
+        finally:
+            conn.close()
+        return {"ok": True}
+    return await asyncio.to_thread(_do)
+
+
+@app.post("/api/schedules/{sched_id}/toggle")
+async def schedules_toggle(sched_id: int, req: Request) -> dict[str, Any]:
+    _check_auth(req)
+    def _do():
+        conn = _schedule_conn()
+        try:
+            cur = conn.execute("SELECT enabled FROM schedules WHERE id = ?", (sched_id,)).fetchone()
+            if not cur:
+                raise HTTPException(404, "Not found")
+            new_enabled = 0 if cur[0] else 1
+            conn.execute("UPDATE schedules SET enabled = ? WHERE id = ?", (new_enabled, sched_id))
+            conn.commit()
+            return {"id": sched_id, "enabled": bool(new_enabled)}
+        finally:
+            conn.close()
+    return await asyncio.to_thread(_do)
+
+
+@app.post("/api/schedules/{sched_id}/run")
+async def schedules_run_now(sched_id: int, req: Request) -> dict[str, Any]:
+    _check_auth(req)
+    def _fetch():
+        conn = _schedule_conn()
+        try:
+            row = conn.execute(
+                "SELECT id, name, when_spec, recipe, recipe_args, enabled, last_run_ts, next_run_ts "
+                "FROM schedules WHERE id = ?", (sched_id,),
+            ).fetchone()
+            return row
+        finally:
+            conn.close()
+    row = await asyncio.to_thread(_fetch)
+    if not row:
+        raise HTTPException(404, "Not found")
+    run_id = await _run_schedule_now(row)
+    return {"task_run_id": run_id}
+
+
+@app.get("/api/schedules/{sched_id}/runs")
+async def schedules_runs(sched_id: int, req: Request) -> dict[str, Any]:
+    _check_auth(req)
+    try:
+        limit = max(1, min(int(req.query_params.get("limit", "20")), 200))
+    except ValueError:
+        limit = 20
+    def _do():
+        conn = _schedule_conn()
+        try:
+            rows = conn.execute(
+                "SELECT id, started_at, finished_at, ok, output FROM task_runs "
+                "WHERE schedule_id = ? ORDER BY started_at DESC LIMIT ?",
+                (sched_id, limit),
+            ).fetchall()
+            return {"runs": [
+                {"id": r[0], "started_at": r[1], "finished_at": r[2],
+                 "ok": bool(r[3]), "output": r[4]}
+                for r in rows
+            ]}
+        finally:
+            conn.close()
+    return await asyncio.to_thread(_do)
+
+
+# ---------------------------------------------------------------------------
 # Code Review (/api/codereview)
 #
 # Stream a code review from Ollama for a path that can be:

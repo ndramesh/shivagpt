@@ -2132,6 +2132,9 @@
         { name: '/tp', desc: 'Your Schwab / ThinkOrSwim account: balances + positions (read-only)', hasArgs: false },
         { name: '/watchlist', desc: 'Track tickers — `add NVDA AAPL`, `remove TSLA`, `clear`, or no args to list', hasArgs: true, hint: '[add|remove|clear] [tickers]' },
         { name: '/history', desc: 'Recent prompts (↑/↓ in composer to walk through). `clear` to wipe', hasArgs: true, hint: '[clear|search <text>]' },
+        { name: '/kb', desc: 'Knowledge bases — list, create, ingest a folder, or delete', hasArgs: true, hint: '[list|new <name>|ingest <name> <path>|delete <name>]' },
+        { name: '/ask', desc: 'Answer a question grounded in a KB (RAG)', hasArgs: true, hint: '[-kb <name>] <question>' },
+        { name: '/schedule', desc: 'Recurring tasks — `add NAME when RECIPE [args]`, list, run, delete', hasArgs: true, hint: '[list|add|run|delete|on|off|view] [...]' },
       ];
 
       const BUILT_IN_PRESETS = [
@@ -4445,6 +4448,234 @@
               url: fUrl,
               instructions: fInstr || '',
             }, c, asst, contentEl, cursor, 'Fetching the page…');
+            break;
+          }
+
+          case '/kb': {
+            // /kb [list]                       — list knowledge bases
+            // /kb new <name>                   — create empty KB
+            // /kb ingest <name> <path>         — chunk + embed a folder/file
+            // /kb delete <name>                — wipe a KB
+            if (!state.adminToken) { toast('Admin login required'); break; }
+            const tokens = (args || '').trim().split(/\s+/).filter(Boolean);
+            const sub = (tokens[0] || 'list').toLowerCase();
+            if (!c) c = newConvo();
+            c.messages.push({ role: 'user', content: `/kb ${args || 'list'}`, ts: Date.now() });
+            autoTitleFromFirstUserMsg(c);
+            c.updatedAt = Date.now();
+            persistAll();
+            renderSidebar();
+            renderActive();
+
+            const auth = { 'Authorization': `Bearer ${state.adminToken}`, 'content-type': 'application/json' };
+
+            const note = (md) => {
+              c.messages.push({ role: 'system', content: md, ts: Date.now() });
+              persistAll(); renderActive(); scrollToBottom();
+            };
+
+            try {
+              if (sub === 'list') {
+                const r = await fetch('/api/kb/list', { headers: auth });
+                if (!r.ok) throw new Error(await r.text());
+                const data = await r.json();
+                if (!data.kbs.length) {
+                  note('*No knowledge bases yet.* Try `/kb ingest mynotes /path/to/folder` to create one.');
+                  break;
+                }
+                let md = `## Knowledge bases (${data.kbs.length})\n\n`;
+                md += '| Name | Docs | Chunks | Embed model |\n|---|---:|---:|---|\n';
+                for (const kb of data.kbs) {
+                  md += `| **${kb.name}** | ${kb.doc_count} | ${kb.chunk_count} | \`${kb.embed_model}\` |\n`;
+                }
+                md += '\nQuery one with `/ask -kb <name> your question`.';
+                note(md);
+              } else if (sub === 'new' || sub === 'create') {
+                const name = tokens[1];
+                if (!name) { toast('Usage: /kb new <name>'); break; }
+                const r = await fetch('/api/kb/create', {
+                  method: 'POST', headers: auth, body: JSON.stringify({ name }),
+                });
+                if (!r.ok) throw new Error(await r.text());
+                note(`Created empty KB \`${name}\`. Ingest a folder with \`/kb ingest ${name} /path\`.`);
+              } else if (sub === 'ingest') {
+                const name = tokens[1];
+                const path = tokens.slice(2).join(' ');
+                if (!name || !path) { toast('Usage: /kb ingest <name> <path>'); break; }
+                const loadingMsg = { role: 'system', content: `*Embedding \`${path}\` into \`${name}\`… (chunks via nomic-embed-text)*`, ts: Date.now() };
+                c.messages.push(loadingMsg);
+                persistAll(); renderActive(); scrollToBottom();
+                const r = await fetch('/api/kb/ingest', {
+                  method: 'POST', headers: auth, body: JSON.stringify({ name, path }),
+                });
+                if (!r.ok) { loadingMsg.content = `*Ingest failed: ${(await r.text()).slice(0, 400)}*`; persistAll(); renderActive(); break; }
+                const data = await r.json();
+                loadingMsg.content = `Ingested **${data.files_seen}** file(s) into \`${name}\` · ${data.chunks_added} new chunk(s). Total now: ${data.kb_total_docs} docs / ${data.kb_total_chunks} chunks.`;
+                persistAll(); renderActive(); scrollToBottom();
+              } else if (sub === 'delete' || sub === 'rm') {
+                const name = tokens[1];
+                if (!name) { toast('Usage: /kb delete <name>'); break; }
+                if (!confirm(`Delete KB \`${name}\` and all its chunks?`)) break;
+                const r = await fetch('/api/kb/' + encodeURIComponent(name),
+                                     { method: 'DELETE', headers: auth });
+                if (!r.ok) throw new Error(await r.text());
+                note(`Deleted KB \`${name}\`.`);
+              } else {
+                toast(`Unknown /kb subcommand: ${sub}`);
+              }
+            } catch (e) {
+              note(`*KB command failed: ${(e.message || e).toString().slice(0, 400)}*`);
+            }
+            break;
+          }
+
+          case '/ask': {
+            if (!args) { toast('Usage: /ask [-kb <name>] <question>'); break; }
+            if (!state.adminToken) { toast('Admin login required'); break; }
+
+            // Parse optional -kb flag; remainder is the question.
+            let kbName = '';
+            let rest = args.trim();
+            const m = rest.match(/^-kb\s+(\S+)\s+(.*)$/);
+            if (m) { kbName = m[1]; rest = m[2]; }
+            // If no -kb given, ask the user to pick from /kb list
+            if (!kbName) {
+              try {
+                const r = await fetch('/api/kb/list', {
+                  headers: { 'Authorization': `Bearer ${state.adminToken}` },
+                });
+                const data = await r.json();
+                if (!data.kbs.length) { toast('No KBs exist yet. /kb ingest <name> <path> first.'); break; }
+                kbName = data.kbs[0].name;   // pick the first by default
+              } catch (e) {
+                toast('Could not list KBs: ' + e.message);
+                break;
+              }
+            }
+            const question = rest.trim();
+            if (!question) { toast('Missing question'); break; }
+            if (!c) c = newConvo();
+
+            const echo = `/ask -kb ${kbName} ${question}`;
+            c.messages.push({ role: 'user', content: echo, ts: Date.now() });
+            autoTitleFromFirstUserMsg(c);
+            c.updatedAt = Date.now();
+            persistAll();
+            renderSidebar();
+            renderActive();
+
+            const asst = { role: 'assistant', content: '', ts: Date.now(), model: resolveModel(c.model) };
+            c.messages.push(asst);
+            const wrap = $('messages').querySelector('.msg-wrap') || (() => {
+              const n = el('div', { class: 'msg-wrap' });
+              $('messages').innerHTML = ''; $('messages').appendChild(n);
+              return n;
+            })();
+            const node = renderMsg(asst);
+            wrap.appendChild(node);
+            const contentEl = node.querySelector('.msg-content');
+            const cursor = el('span', { class: 'typing-cursor' });
+            contentEl.appendChild(cursor);
+            scrollToBottom();
+
+            await streamFromEndpoint('/api/ask', {
+              kb: kbName,
+              query: question,
+            }, c, asst, contentEl, cursor, 'Retrieving + answering…');
+            break;
+          }
+
+          case '/schedule': {
+            if (!state.adminToken) { toast('Admin login required'); break; }
+            const tokens = (args || '').trim().split(/\s+/).filter(Boolean);
+            const sub = (tokens[0] || 'list').toLowerCase();
+            if (!c) c = newConvo();
+            c.messages.push({ role: 'user', content: `/schedule ${args || 'list'}`, ts: Date.now() });
+            autoTitleFromFirstUserMsg(c);
+            c.updatedAt = Date.now();
+            persistAll();
+            renderSidebar();
+            renderActive();
+
+            const auth = { 'Authorization': `Bearer ${state.adminToken}`, 'content-type': 'application/json' };
+            const note = (md) => {
+              c.messages.push({ role: 'system', content: md, ts: Date.now() });
+              persistAll(); renderActive(); scrollToBottom();
+            };
+            const fmtTs = (ms) => ms ? new Date(ms).toLocaleString() : 'never';
+
+            try {
+              if (sub === 'list') {
+                const r = await fetch('/api/schedules', { headers: auth });
+                if (!r.ok) throw new Error(await r.text());
+                const data = await r.json();
+                if (!data.schedules.length) {
+                  note('*No schedules yet.* Try `/schedule add morning_brief "weekday 07:30" portfolio` to start.');
+                  break;
+                }
+                let md = `## Schedules (${data.schedules.length})\n\n`;
+                md += '| ID | Name | When | Recipe | Enabled | Last run | Next run |\n|---:|---|---|---|---:|---|---|\n';
+                for (const s of data.schedules) {
+                  md += `| ${s.id} | **${s.name}** | \`${s.when}\` | ${s.recipe}${s.recipe_args ? ' ' + s.recipe_args : ''} | ${s.enabled ? '✓' : '✗'} | ${fmtTs(s.last_run_ts)} | ${fmtTs(s.next_run_ts)} |\n`;
+                }
+                md += '\nManage: `/schedule run ID`, `/schedule view ID`, `/schedule on|off ID`, `/schedule delete ID`.';
+                note(md);
+              } else if (sub === 'add') {
+                // /schedule add NAME "when" recipe [args...]
+                // Parse: take name, then quoted-or-single-token when, then recipe + rest.
+                const m = (args || '').match(/^add\s+(\S+)\s+"([^"]+)"\s+(\S+)\s*(.*)$/) ||
+                          (args || '').match(/^add\s+(\S+)\s+(\S+\s+\S+)\s+(\S+)\s*(.*)$/);
+                if (!m) {
+                  toast('Usage: /schedule add NAME "WHEN" RECIPE [args]  — e.g. /schedule add brief "weekday 07:30" portfolio');
+                  break;
+                }
+                const [, name, when_, recipe, recipe_args] = m;
+                const r = await fetch('/api/schedules', {
+                  method: 'POST', headers: auth,
+                  body: JSON.stringify({ name, when: when_, recipe, recipe_args: recipe_args || '' }),
+                });
+                if (!r.ok) throw new Error(await r.text());
+                const data = await r.json();
+                note(`Added schedule **#${data.id}** \`${name}\` — next run: ${fmtTs(data.next_run_ts)}.`);
+              } else if (sub === 'run') {
+                const id = parseInt(tokens[1], 10);
+                if (!id) { toast('Usage: /schedule run ID'); break; }
+                const r = await fetch(`/api/schedules/${id}/run`, { method: 'POST', headers: auth });
+                if (!r.ok) throw new Error(await r.text());
+                const data = await r.json();
+                note(`Triggered run for #${id} — \`/schedule view ${id}\` to see the result.`);
+              } else if (sub === 'delete' || sub === 'rm') {
+                const id = parseInt(tokens[1], 10);
+                if (!id) { toast('Usage: /schedule delete ID'); break; }
+                if (!confirm(`Delete schedule #${id} and its run history?`)) break;
+                const r = await fetch(`/api/schedules/${id}`, { method: 'DELETE', headers: auth });
+                if (!r.ok) throw new Error(await r.text());
+                note(`Deleted schedule #${id}.`);
+              } else if (sub === 'on' || sub === 'off' || sub === 'toggle') {
+                const id = parseInt(tokens[1], 10);
+                if (!id) { toast('Usage: /schedule on|off ID'); break; }
+                const r = await fetch(`/api/schedules/${id}/toggle`, { method: 'POST', headers: auth });
+                if (!r.ok) throw new Error(await r.text());
+                const data = await r.json();
+                note(`Schedule #${id} is now ${data.enabled ? 'enabled' : 'disabled'}.`);
+              } else if (sub === 'view' || sub === 'show') {
+                const id = parseInt(tokens[1], 10);
+                if (!id) { toast('Usage: /schedule view ID'); break; }
+                const r = await fetch(`/api/schedules/${id}/runs?limit=5`, { headers: auth });
+                if (!r.ok) throw new Error(await r.text());
+                const data = await r.json();
+                if (!data.runs.length) { note(`*No runs yet for schedule #${id}.*`); break; }
+                let md = `## Schedule #${id} — last ${data.runs.length} run(s)\n\n`;
+                for (const run of data.runs) {
+                  md += `### ${new Date(run.started_at).toLocaleString()} ${run.ok ? '✓' : '✗'}\n\n${run.output || '*no output*'}\n\n---\n`;
+                }
+                note(md);
+              } else {
+                toast(`Unknown /schedule subcommand: ${sub}`);
+              }
+            } catch (e) {
+              note(`*Schedule command failed: ${(e.message || e).toString().slice(0, 400)}*`);
+            }
             break;
           }
 

@@ -4,6 +4,34 @@ All notable changes to ShivaGPT are documented in this file.
 
 ## [Unreleased]
 
+### Added
+- **RAG knowledge bases (`/kb` + `/ask`).** Drop a folder of docs into
+  a named knowledge base; the server chunks them paragraph-aware
+  (~1000 chars with 150 char overlap), embeds via Ollama's
+  `nomic-embed-text`, and stores the float32 vectors as SQLite BLOBs at
+  `data/kb.db`. `/kb list`, `/kb ingest NAME PATH`, `/kb delete NAME`,
+  `/kb new NAME`. Then `/ask -kb NAME your question` does brute-force
+  cosine top-k retrieval (fast at <100k chunks, no external vector
+  store) and streams a cited answer through Ollama. Supports
+  `.txt/.md/code`, PDFs (via pypdf), and HTML (via trafilatura).
+  New endpoints: `POST /api/kb/{create,ingest,search}`,
+  `GET /api/kb/list`, `DELETE /api/kb/{name}`, `POST /api/ask`. Env
+  knobs: `KB_DB_PATH`, `KB_EMBED_MODEL` (default `nomic-embed-text`),
+  `KB_CHUNK_CHARS`, `KB_CHUNK_OVERLAP`, `KB_DEFAULT_TOP_K`.
+
+- **Scheduled tasks (`/schedule`).** In-process scheduler (no
+  APScheduler dep): an asyncio loop ticks every 30s, picks up due
+  jobs, runs them through "recipes." Stored in `data/schedules.db`
+  alongside a `task_runs` log. Schedule syntax: `daily HH:MM`,
+  `weekday HH:MM`, `weekend HH:MM`, `every Nm`, `every Nh`. Recipes:
+  `portfolio` (Alpaca account brief), `watchlist TICKER,TICKER,...`,
+  `stock TICKER`, `ask KB|QUESTION`. `/schedule add NAME "WHEN"
+  RECIPE [args]`, `/schedule list`, `/schedule run ID`,
+  `/schedule view ID` (last 5 runs), `/schedule on|off ID`,
+  `/schedule delete ID`. Endpoints: `GET/POST /api/schedules`,
+  `DELETE /api/schedules/{id}`, `POST /api/schedules/{id}/{run,toggle}`,
+  `GET /api/schedules/{id}/runs`.
+
 ### Fixed
 - **`/imgen` and `/api/transcribe` hit EROFS on first model download.**
   Root cause: the systemd unit shipped with `ProtectHome=read-only` and
