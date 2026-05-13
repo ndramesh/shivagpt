@@ -485,7 +485,11 @@ def _process_image(img_bytes: bytes, operation: str, params: dict) -> tuple[byte
                     "-o", f_out.name,
                     "-s", str(scale),
                     "-m", str(models_dir),
-                    "-n", "remacri",
+                    # Model basename (Upscayl looks for <name>.bin + <name>.param
+                    # inside models_dir). Default matches the file shipped with
+                    # Upscayl v2.15+. Override via UPSCAYL_MODEL env if you want
+                    # ultrasharp-4x, high-fidelity-4x, etc.
+                    "-n", os.getenv("UPSCAYL_MODEL", "remacri-4x"),
                 ]
                 try:
                     subprocess.run(cmd, check=True, capture_output=True)
