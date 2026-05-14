@@ -2492,14 +2492,24 @@ async def _llm_sentiment(ticker: str, posts: list[dict],
                     "thesis": "LLM unavailable", "rating": 50}
 
         raw = (r.json().get("message") or {}).get("content", "")
-        # Strip thinking blocks if present (even if unclosed due to truncation)
-        raw = re.sub(r"<think>[\s\S]*?(?:</think>\s*|$)", "", raw,
-                     flags=re.IGNORECASE)
-        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(),
-                     flags=re.IGNORECASE)
-        raw = re.sub(r"\s*```\s*$", "", raw)
+        
+        # 1. Strip thinking blocks if present (even if unclosed due to truncation)
+        raw = re.sub(r"<think>[\s\S]*?(?:</think>\s*|$)", "", raw, flags=re.IGNORECASE)
+        
+        # 2. Extract JSON payload (find first { and last })
+        start = raw.find('{')
+        end = raw.rfind('}')
+        if start != -1 and end != -1 and end >= start:
+            json_str = raw[start:end+1]
+        else:
+            json_str = raw  # Fallback
+            
+        try:
+            result = json.loads(json_str)
+        except Exception as e:
+            log.warning("trader llm json parse failed for %s: %s (Raw: %r)", ticker, e, raw[:200])
+            raise
 
-        result = json.loads(raw)
         result["sentiment"] = str(
             result.get("sentiment", "neutral")).lower()
         result["confidence"] = max(0.0, min(1.0, float(
@@ -2510,7 +2520,7 @@ async def _llm_sentiment(ticker: str, posts: list[dict],
     except Exception as e:
         log.warning("trader llm sentiment for %s failed: %s", ticker, e)
         return {"sentiment": "neutral", "confidence": 0.3,
-                "thesis": "Analysis failed", "rating": 50}
+                "thesis": f"Analysis failed", "rating": 50}
 
 
 def _compute_conviction(ticker_data: dict) -> int:
