@@ -2619,7 +2619,10 @@ async def _run_trader_scan(body: dict) -> dict[str, Any]:
     
     async def _safe_sentiment(c):
         async with sem:
-            return await _llm_sentiment(c["ticker"], c["posts"], model=sentiment_model)
+            log.info("trader llm: analyzing %s...", c["ticker"])
+            res = await _llm_sentiment(c["ticker"], c["posts"], model=sentiment_model)
+            log.info("trader llm: finished %s", c["ticker"])
+            return res
 
     sentiments = await asyncio.gather(*(
         _safe_sentiment(c) for c in candidates
