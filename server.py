@@ -2493,23 +2493,7 @@ def _compute_conviction(ticker_data: dict) -> int:
     return max(0, min(100, score))
 
 
-@app.post("/api/trader")
-async def trader_scan(req: Request) -> dict[str, Any]:
-    """Scan social media + market data for trending tickers.
-
-    Body: {
-        focus?: "momentum" | "options" | "value" | "earnings",
-        sector?: str,
-        ticker?: str,            # deep dive on one ticker
-        limit?: int,             # max tickers to return (default 15)
-        sources?: list[str],     # ["reddit","stocktwits","finviz","yahoo"]
-        sentiment_model?: str,   # Ollama model for sentiment
-    }
-    """
-    try:
-        body = await req.json()
-    except Exception:
-        body = {}
+async def _run_trader_scan(body: dict) -> dict[str, Any]:
 
     focus = (body.get("focus") or "").strip().lower()
     sector = (body.get("sector") or "").strip().lower()
@@ -4059,6 +4043,64 @@ async def _recipe_morning_brief(args: str) -> str:
     return "\n\n---\n\n".join(sections)
 
 
+@app.post("/api/trader")
+async def trader_scan(req: Request) -> dict[str, Any]:
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+    return await _run_trader_scan(body)
+
+
+async def _recipe_trader(args: str) -> str:
+    """Run the trader scanner and return a Markdown report."""
+    import time
+    body = {}
+    args = (args or "").strip()
+    if args:
+        parts = args.split()
+        i = 0
+        while i < len(parts):
+            if parts[i] in ("-ticker", "-t") and i+1 < len(parts):
+                body["ticker"] = parts[i+1]
+                i += 2
+            elif parts[i] in ("-limit", "-l", "-num", "-n") and i+1 < len(parts):
+                try: body["limit"] = int(parts[i+1])
+                except Exception: pass
+                i += 2
+            elif parts[i] in ("-model", "-m") and i+1 < len(parts):
+                body["sentiment_model"] = parts[i+1]
+                i += 2
+            else:
+                i += 1
+
+    res = await _run_trader_scan(body)
+    cands = res.get("results", [])
+    if not cands:
+        return "_No trader scan results found._"
+    
+    out = [f"## Trader Sentiment Scan — {time.strftime('%a %b %d, %Y')}\n"]
+    for c in cands:
+        t = c["ticker"]
+        score = c["conviction_score"]
+        sent = c.get("sentiment", {})
+        s_val = sent.get("sentiment", "neutral").upper()
+        rating = sent.get("rating", 50)
+        thesis = sent.get("thesis", "No thesis provided.")
+        out.append(f"### ${t} (Conviction: {score}/100, Sentiment: {s_val} {rating}/100)")
+        out.append(f"**Thesis**: {thesis}\n")
+        posts = c.get("posts", [])
+        if posts:
+            out.append("**Top Posts:**")
+            for p in posts[:3]:
+                src = p.get("source", "?")
+                pscore = p.get("score", 0)
+                title = p.get("title", "")
+                out.append(f"- [{src}] (score: {pscore}) {title}")
+        out.append("\n---\n")
+    return "\n".join(out)
+
+
 RECIPES = {
     "portfolio": _recipe_portfolio,
     "watchlist": _recipe_watchlist,
@@ -4067,6 +4109,7 @@ RECIPES = {
     "top_news": _recipe_top_news,
     "premarket": _recipe_premarket,
     "morning_brief": _recipe_morning_brief,
+    "trader": _recipe_trader,
 }
 
 

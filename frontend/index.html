@@ -5640,6 +5640,8 @@ tickerRows,
 '</div>',
 '<div class="trader-actions">',
 '<button class="trader-action-btn" onclick="document.querySelector(\'#composer textarea\').value=\'/trader\';document.querySelector(\'#composer textarea\').focus()" type="button">🔄 Rescan</button>',
+'<button class="trader-action-btn" onclick="window.traderDownloadImage(this)" type="button">🖼️ Save PNG</button>',
+'<button class="trader-action-btn" onclick="window.traderDownloadPdf(this)" type="button">📄 Save PDF</button>',
 '</div>',
 '</div>',
         ].join('\n');
@@ -5767,25 +5769,20 @@ finalHtml,
       // Convert the rendered palm card to a high-DPI canvas. Used by both the
       // PNG and PDF download paths. Action buttons are temporarily hidden so
       // they don't appear in the saved output.
-      async function _palmCardToCanvas(card) {
+      async function _cardToCanvas(card, actionsSelector) {
         if (!window.html2canvas) {
           throw new Error('html2canvas not loaded yet — give the CDN a moment and retry.');
         }
-        const actions = card.querySelector('.palm-actions');
+        const actions = card.querySelector(actionsSelector);
         const prevDisplay = actions ? actions.style.display : '';
         if (actions) actions.style.display = 'none';
         try {
-          // Read the actual computed bg color so the screenshot doesn't end
-          // up with a transparent / mismatched background.
           const bg = getComputedStyle(card).backgroundColor || '#0e1014';
           return await html2canvas(card, {
             backgroundColor: bg,
             scale: window.devicePixelRatio > 1 ? 2 : 1.5,
             logging: false,
             useCORS: true,
-            // html2canvas can fail when the image element doesn't have
-            // crossOrigin set; we use data: URLs for the palm photo so
-            // this is fine, but flag it anyway.
             allowTaint: false,
           });
         } finally {
@@ -5800,7 +5797,7 @@ finalHtml,
         btn.disabled = true;
         btn.textContent = '⏳ Rendering…';
         try {
-          const canvas = await _palmCardToCanvas(card);
+          const canvas = await _cardToCanvas(card, '.palm-actions');
           await new Promise((resolve, reject) => {
             canvas.toBlob((blob) => {
               if (!blob) { reject(new Error('toBlob returned null')); return; }
@@ -5825,6 +5822,38 @@ finalHtml,
         }
       }
 
+      async function traderDownloadImage(btn) {
+        const card = btn && btn.closest('.trader-card');
+        if (!card) return;
+        const origLabel = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '⏳ Rendering…';
+        try {
+          const canvas = await _cardToCanvas(card, '.trader-actions');
+          await new Promise((resolve, reject) => {
+            canvas.toBlob((blob) => {
+              if (!blob) { reject(new Error('toBlob returned null')); return; }
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = `trader-report-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.png`;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              setTimeout(() => URL.revokeObjectURL(url), 1000);
+              resolve();
+            }, 'image/png');
+          });
+          toast('Saved trader report as PNG');
+        } catch (e) {
+          console.error(e);
+          toast('Image save failed: ' + (e.message || e));
+        } finally {
+          btn.disabled = false;
+          btn.textContent = origLabel;
+        }
+      }
+
       // PDF builder, take 3. Renders the WHOLE palm-card to one big canvas
       // (so grid layouts and font sizing match what's on screen, instead of
       // being re-laid-out when each section gets its own html2canvas call),
@@ -5837,8 +5866,8 @@ finalHtml,
       //
       // Diagnostic console.log lines print each section's height and page
       // placement decision so future regressions are visible in DevTools.
-      async function palmDownloadPdf(btn) {
-        const card = btn && btn.closest('.palm-card');
+      async function _buildPdfFromCard(btn, cardClass, sectionSelector, actionsSelector, filePrefix, itemName) {
+        const card = btn && btn.closest(cardClass);
         if (!card) return;
         if (!window.jspdf || !window.jspdf.jsPDF) {
           toast('PDF library still loading — try again in a moment.');
@@ -5853,18 +5882,16 @@ finalHtml,
         btn.textContent = '⏳ Building PDF…';
 
         // Hide the action buttons (and stash their display so we can restore).
-        const actions = card.querySelector('.palm-actions');
+        const actions = card.querySelector(actionsSelector);
         const prevActionsDisplay = actions ? actions.style.display : '';
         if (actions) actions.style.display = 'none';
 
         try {
-          const sections = Array.from(card.querySelectorAll('.palm-section'));
+          const sections = Array.from(card.querySelectorAll(sectionSelector));
           if (!sections.length) {
-            throw new Error('No .palm-section blocks found in the card.');
+            throw new Error(`No sections matching ${sectionSelector} found.`);
           }
 
-          // Parse CSS bg color → [r, g, b] for jsPDF's setFillColor (which
-          // doesn't accept raw "rgb(…)" strings).
           const cardBg = getComputedStyle(card).backgroundColor || 'rgb(14, 16, 20)';
           const _parseColor = (css) => {
             const m = css.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
@@ -5878,10 +5905,6 @@ finalHtml,
           const [bgR, bgG, bgB] = _parseColor(cardBg);
 
           const scale = 2;
-          // 1. Render the WHOLE card at high DPI in one pass. This makes the
-          //    grid layouts (palm-grid4 et al.) match exactly what the user
-          //    sees, instead of being relaid-out when we hand a fragment to
-          //    html2canvas. Cost: more memory; benefit: no layout drift.
           const fullCanvas = await html2canvas(card, {
             backgroundColor: cardBg,
             scale,
@@ -5890,21 +5913,16 @@ finalHtml,
             allowTaint: false,
             windowWidth: card.offsetWidth || 720,
           });
-          console.log('palm pdf: full card render',
-                      fullCanvas.width, 'x', fullCanvas.height, 'px @', scale + 'x');
 
-          // 2. Compute each section's canvas-pixel boundary relative to the
-          //    card's top-left, using the same scale we rendered at.
           const cardRect = card.getBoundingClientRect();
           const sectionBoundaries = sections.map((sec) => {
             const r = sec.getBoundingClientRect();
             const top = Math.round((r.top - cardRect.top) * scale);
             const bottom = Math.round((r.bottom - cardRect.top) * scale);
-            return { name: sec.className.replace('palm-section', '').trim() || '?',
+            return { name: sec.className.replace(/-section|-row/g, '').trim() || '?',
                      top, bottom, height: bottom - top };
           });
 
-          // 3. Set up PDF page geometry.
           const { jsPDF } = window.jspdf;
           const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'letter' });
           const pageW = pdf.internal.pageSize.getWidth();
@@ -5912,7 +5930,7 @@ finalHtml,
           const margin = 40;
           const usableW = pageW - 2 * margin;
           const usableH = pageH - 2 * margin;
-          const gap = 10;   // pt of vertical air between sections sharing a page
+          const gap = 10;
           const pxToPt = usableW / fullCanvas.width;
 
           let pageIndex = 0;
@@ -5924,8 +5942,6 @@ finalHtml,
           };
           paintPageBg();
 
-          // Slice a region [yTopPx, yBotPx) from fullCanvas → standalone canvas
-          // → JPEG → draw on current PDF page at cursorY (in pt).
           const placeSlice = (yTopPx, yBotPx, heightPt) => {
             const sliceHpx = yBotPx - yTopPx;
             if (sliceHpx <= 0) return;
@@ -5937,32 +5953,21 @@ finalHtml,
             ctx.fillRect(0, 0, slice.width, slice.height);
             ctx.drawImage(
               fullCanvas,
-              0, yTopPx, fullCanvas.width, sliceHpx,    // source rect
-              0, 0, slice.width, sliceHpx                // dest rect
+              0, yTopPx, fullCanvas.width, sliceHpx,
+              0, 0, slice.width, sliceHpx
             );
             const dataUrl = slice.toDataURL('image/jpeg', 0.92);
             pdf.addImage(dataUrl, 'JPEG', margin, cursorY, usableW, heightPt);
           };
 
-          // 4. Pack sections. Each section is atomic: either it fits in the
-          //    space remaining on the current page, or we advance to a fresh
-          //    page first. The only time a section is split is if it's taller
-          //    than one whole page on its own — then we slice it across pages
-          //    but at least the cuts happen at predictable pixel boundaries.
           for (let i = 0; i < sectionBoundaries.length; i++) {
             const sb = sectionBoundaries[i];
             const heightPt = sb.height * pxToPt;
             const remaining = (pageH - margin) - cursorY;
 
-            console.log(`palm pdf: section ${i} "${sb.name}" — ${sb.height}px / ${heightPt.toFixed(1)}pt (page ${pageIndex + 1} has ${remaining.toFixed(1)}pt remaining)`);
-
             if (heightPt > usableH) {
-              // Pathologically tall section — bigger than a whole page. Start
-              // a fresh page if needed, then slice this single section across
-              // multiple pages.
               if (cursorY > margin) {
                 pdf.addPage(); pageIndex++; paintPageBg(); cursorY = margin;
-                console.log(`palm pdf:   advancing to page ${pageIndex + 1} (oversize section)`);
               }
               const pxPerPage = Math.floor(fullCanvas.width * (usableH / usableW));
               let yPx = sb.top;
@@ -5979,21 +5984,17 @@ finalHtml,
               continue;
             }
 
-            // Normal section. If it won't fit in what's left of this page,
-            // advance to a fresh one first.
             if (heightPt > remaining && cursorY > margin) {
               pdf.addPage(); pageIndex++; paintPageBg(); cursorY = margin;
-              console.log(`palm pdf:   advancing to page ${pageIndex + 1} (section won't fit remaining ${remaining.toFixed(1)}pt)`);
             }
             placeSlice(sb.top, sb.bottom, heightPt);
             cursorY += heightPt + gap;
           }
 
           const totalPages = pageIndex + 1;
-          const fname = `palm-reading-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.pdf`;
+          const fname = `${filePrefix}-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.pdf`;
           pdf.save(fname);
-          console.log(`palm pdf: saved ${fname} (${totalPages} page${totalPages === 1 ? '' : 's'})`);
-          toast(`Saved palm reading as PDF (${totalPages} page${totalPages === 1 ? '' : 's'})`);
+          toast(`Saved ${itemName} as PDF (${totalPages} page${totalPages === 1 ? '' : 's'})`);
         } catch (e) {
           console.error(e);
           toast('PDF save failed: ' + (e.message || e));
@@ -6003,10 +6004,20 @@ finalHtml,
           btn.textContent = origLabel;
         }
       }
+
+      async function palmDownloadPdf(btn) {
+        return _buildPdfFromCard(btn, '.palm-card', '.palm-section', '.palm-actions', 'palm-reading', 'palm reading');
+      }
+
+      async function traderDownloadPdf(btn) {
+        return _buildPdfFromCard(btn, '.trader-card', '.trader-banner, .trader-ticker-row, .trader-footer', '.trader-actions', 'trader-report', 'trader report');
+      }
       // Expose globally so the inline onclick handlers on the rendered card
       // (which lives inside an .innerHTML-rendered subtree) can resolve them.
       window.palmDownloadImage = palmDownloadImage;
       window.palmDownloadPdf = palmDownloadPdf;
+      window.traderDownloadImage = traderDownloadImage;
+      window.traderDownloadPdf = traderDownloadPdf;
 
       // Render the watchlist as a compact dashboard with one row per ticker
       // and a small chart embedded per row. The `results` array is the raw
