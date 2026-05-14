@@ -3879,12 +3879,12 @@
         for (const f of pendingFiles) {
           if (f.kind === 'image' && f.base64) {
             images.push(f.base64);
-            contentParts.push(`[Attached image: ${f.filename}]`);
+            contentParts.push(`🖼️ UPLOADED IMAGE: ${f.filename}`);
           } else if (f.kind === 'text' && f.text) {
             const label = f.mime === 'application/pdf'
-              ? `[Attached: ${f.filename} (${f.pages || '?'} pages${f.truncated ? ', truncated' : ''})]`
-              : `[Attached: ${f.filename}]`;
-            contentParts.push(label + '\n' + f.text);
+              ? `📄 CONTENT OF UPLOADED FILE: ${f.filename} (${f.pages || '?'} pages${f.truncated ? ', truncated' : ''})`
+              : `📄 CONTENT OF UPLOADED FILE: ${f.filename}`;
+            contentParts.push(label + '\n```text\n' + f.text + '\n```');
           }
         }
         if (text) contentParts.push(text);
@@ -5492,7 +5492,7 @@
             scrollToBottom();
 
             try {
-              const trBody = { limit: traderLimit };
+              const trBody = { limit: traderLimit, sentiment_model: resolveModel(c.model) };
               if (traderTicker) trBody.ticker = traderTicker;
 
               const tr = await fetch(apiUrl('/api/trader'), {
@@ -5650,8 +5650,29 @@ tickerRows,
       // designed infographic — banner, photo + overview, trait pills, lines,
       // life-area panels, strengths/challenges, final reading.
       function renderPalmReading(r, imgFile) {
-        const esc = (s) => (s == null ? '' : String(s)
-          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+        // esc(): defensive HTML strip + entity escape.
+        //   1. Decode common entities the model might still emit (&lt;, &amp;…)
+        //      so step 2's tag-stripper can catch already-escaped HTML.
+        //   2. Strip real HTML tags. The leading-char restriction
+        //      ([a-zA-Z/!]) avoids eating natural prose like "3 < 5".
+        //   3. Standard entity-escape for safe injection into our template.
+        // (Server-side _scrub does the same work; this is belt-and-suspenders
+        // for the case where the server isn't yet redeployed.)
+        const _decodeEntities = (s) => s
+          .replace(/&lt;/gi, '<')
+          .replace(/&gt;/gi, '>')
+          .replace(/&amp;/gi, '&')
+          .replace(/&quot;/gi, '"')
+          .replace(/&#39;/g, "'");
+        const esc = (s) => {
+          if (s == null) return '';
+          let v = String(s);
+          v = _decodeEntities(v);
+          v = v.replace(/<[a-zA-Z/!][^>]*>/g, '');
+          v = v.replace(/```[\s\S]*?```/g, '');
+          v = v.replace(/`([^`]+)`/g, '$1');
+          return v.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+        };
         const lines = r.lines || {};
         const dataUrl = imgFile && imgFile.base64
           ? `data:${imgFile.mime || 'image/png'};base64,${imgFile.base64}`
@@ -5801,11 +5822,18 @@ finalHtml,
         }
       }
 
-      // Section-aware PDF builder: renders each .palm-section to its own
-      // canvas, then packs them into pages without ever splitting a section
-      // across a page boundary. If a single section is taller than a page on
-      // its own, it slices that section across multiple pages using the
-      // 9-arg drawImage form for pixel-accurate source-rect extraction.
+      // PDF builder, take 3. Renders the WHOLE palm-card to one big canvas
+      // (so grid layouts and font sizing match what's on screen, instead of
+      // being re-laid-out when each section gets its own html2canvas call),
+      // then slices that canvas at each .palm-section's getBoundingClientRect.
+      // Section boundaries align pixel-for-pixel with on-screen rendering,
+      // and pagination only inserts page breaks between sections — never
+      // mid-section unless a single section happens to be taller than a
+      // full page (in which case it falls back to in-section slicing, but
+      // still aligned to a known boundary).
+      //
+      // Diagnostic console.log lines print each section's height and page
+      // placement decision so future regressions are visible in DevTools.
       async function palmDownloadPdf(btn) {
         const card = btn && btn.closest('.palm-card');
         if (!card) return;
@@ -5821,7 +5849,7 @@ finalHtml,
         btn.disabled = true;
         btn.textContent = '⏳ Building PDF…';
 
-        // Hide the action buttons while we capture sections.
+        // Hide the action buttons (and stash their display so we can restore).
         const actions = card.querySelector('.palm-actions');
         const prevActionsDisplay = actions ? actions.style.display : '';
         if (actions) actions.style.display = 'none';
@@ -5831,35 +5859,49 @@ finalHtml,
           if (!sections.length) {
             throw new Error('No .palm-section blocks found in the card.');
           }
-          const cardBg = getComputedStyle(card).backgroundColor || '#0e1014';
 
-          // Parse the CSS background color into [r, g, b] for jsPDF.
-          // jsPDF's setFillColor does NOT accept raw CSS strings like
-          // "rgb(14, 16, 20)" — it needs numeric (r, g, b) or a hex string.
+          // Parse CSS bg color → [r, g, b] for jsPDF's setFillColor (which
+          // doesn't accept raw "rgb(…)" strings).
+          const cardBg = getComputedStyle(card).backgroundColor || 'rgb(14, 16, 20)';
           const _parseColor = (css) => {
             const m = css.match(/rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)/);
             if (m) return [+m[1], +m[2], +m[3]];
             if (css.startsWith('#') && css.length >= 7)
-              return [parseInt(css.slice(1,3),16), parseInt(css.slice(3,5),16), parseInt(css.slice(5,7),16)];
-            return [14, 16, 20]; // fallback dark bg
+              return [parseInt(css.slice(1, 3), 16),
+                      parseInt(css.slice(3, 5), 16),
+                      parseInt(css.slice(5, 7), 16)];
+            return [14, 16, 20];
           };
           const [bgR, bgG, bgB] = _parseColor(cardBg);
 
-          // Use a fixed 2x scale for consistent PDF quality across devices.
-          const renderOpts = {
+          const scale = 2;
+          // 1. Render the WHOLE card at high DPI in one pass. This makes the
+          //    grid layouts (palm-grid4 et al.) match exactly what the user
+          //    sees, instead of being relaid-out when we hand a fragment to
+          //    html2canvas. Cost: more memory; benefit: no layout drift.
+          const fullCanvas = await html2canvas(card, {
             backgroundColor: cardBg,
-            scale: 2,
+            scale,
             logging: false,
             useCORS: true,
             allowTaint: false,
-          };
+            windowWidth: card.offsetWidth || 720,
+          });
+          console.log('palm pdf: full card render',
+                      fullCanvas.width, 'x', fullCanvas.height, 'px @', scale + 'x');
 
-          // Render every section to its own canvas, in DOM order.
-          const sectionCanvases = [];
-          for (const sec of sections) {
-            sectionCanvases.push(await html2canvas(sec, renderOpts));
-          }
+          // 2. Compute each section's canvas-pixel boundary relative to the
+          //    card's top-left, using the same scale we rendered at.
+          const cardRect = card.getBoundingClientRect();
+          const sectionBoundaries = sections.map((sec) => {
+            const r = sec.getBoundingClientRect();
+            const top = Math.round((r.top - cardRect.top) * scale);
+            const bottom = Math.round((r.bottom - cardRect.top) * scale);
+            return { name: sec.className.replace('palm-section', '').trim() || '?',
+                     top, bottom, height: bottom - top };
+          });
 
+          // 3. Set up PDF page geometry.
           const { jsPDF } = window.jspdf;
           const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'letter' });
           const pageW = pdf.internal.pageSize.getWidth();
@@ -5867,81 +5909,87 @@ finalHtml,
           const margin = 40;
           const usableW = pageW - 2 * margin;
           const usableH = pageH - 2 * margin;
-          const gap = 10;   // pt of vertical space between sections on the same page
+          const gap = 10;   // pt of vertical air between sections sharing a page
+          const pxToPt = usableW / fullCanvas.width;
 
           let pageIndex = 0;
           let cursorY = margin;
 
-          // Paint the page background so margins don't sit on glaring white
-          // (the on-screen card uses a dark bg; the PDF should match).
           const paintPageBg = () => {
             pdf.setFillColor(bgR, bgG, bgB);
             pdf.rect(0, 0, pageW, pageH, 'F');
           };
           paintPageBg();
 
-          // Add one section to the running page; if it doesn't fit, advance
-          // to a fresh page first.
-          const placeSection = (canvas) => {
-            const drawH = (canvas.height / canvas.width) * usableW;
-
-            // Section fits in the page entirely → place it (possibly after
-            // advancing the page if it's too tall to fit in remaining space).
-            if (drawH <= usableH) {
-              if (cursorY + drawH > pageH - margin && cursorY > margin) {
-                pdf.addPage();
-                pageIndex++;
-                paintPageBg();
-                cursorY = margin;
-              }
-              pdf.addImage(canvas.toDataURL('image/jpeg', 0.92),
-                           'JPEG', margin, cursorY, usableW, drawH);
-              cursorY += drawH + gap;
-              return;
-            }
-
-            // Section taller than a single page on its own — start a fresh
-            // page and slice this section across as many pages as needed.
-            if (cursorY > margin) {
-              pdf.addPage();
-              pageIndex++;
-              paintPageBg();
-              cursorY = margin;
-            }
-            // How many source-canvas pixels fit per PDF page of usable height.
-            const pxPerPage = Math.floor(canvas.width * (usableH / usableW));
-            let yPx = 0;
-            while (yPx < canvas.height) {
-              const sliceH = Math.min(pxPerPage, canvas.height - yPx);
-              const slice = document.createElement('canvas');
-              slice.width = canvas.width;
-              slice.height = sliceH;
-              const ctx = slice.getContext('2d');
-              ctx.fillStyle = cardBg;
-              ctx.fillRect(0, 0, slice.width, slice.height);
-              // Use the 9-arg drawImage to extract the exact source rectangle
-              // instead of the offset-based approach which can mis-clip.
-              ctx.drawImage(canvas,
-                0, yPx, canvas.width, sliceH,   // source rect
-                0, 0,   slice.width,  sliceH);   // dest rect
-              const sliceDrawH = (sliceH / canvas.width) * usableW;
-              pdf.addImage(slice.toDataURL('image/jpeg', 0.92),
-                           'JPEG', margin, margin, usableW, sliceDrawH);
-              yPx += sliceH;
-              if (yPx < canvas.height) {
-                pdf.addPage();
-                pageIndex++;
-                paintPageBg();
-              } else {
-                cursorY = margin + sliceDrawH + gap;
-              }
-            }
+          // Slice a region [yTopPx, yBotPx) from fullCanvas → standalone canvas
+          // → JPEG → draw on current PDF page at cursorY (in pt).
+          const placeSlice = (yTopPx, yBotPx, heightPt) => {
+            const sliceHpx = yBotPx - yTopPx;
+            if (sliceHpx <= 0) return;
+            const slice = document.createElement('canvas');
+            slice.width = fullCanvas.width;
+            slice.height = sliceHpx;
+            const ctx = slice.getContext('2d');
+            ctx.fillStyle = cardBg;
+            ctx.fillRect(0, 0, slice.width, slice.height);
+            ctx.drawImage(
+              fullCanvas,
+              0, yTopPx, fullCanvas.width, sliceHpx,    // source rect
+              0, 0, slice.width, sliceHpx                // dest rect
+            );
+            const dataUrl = slice.toDataURL('image/jpeg', 0.92);
+            pdf.addImage(dataUrl, 'JPEG', margin, cursorY, usableW, heightPt);
           };
 
-          for (const c of sectionCanvases) placeSection(c);
+          // 4. Pack sections. Each section is atomic: either it fits in the
+          //    space remaining on the current page, or we advance to a fresh
+          //    page first. The only time a section is split is if it's taller
+          //    than one whole page on its own — then we slice it across pages
+          //    but at least the cuts happen at predictable pixel boundaries.
+          for (let i = 0; i < sectionBoundaries.length; i++) {
+            const sb = sectionBoundaries[i];
+            const heightPt = sb.height * pxToPt;
+            const remaining = (pageH - margin) - cursorY;
+
+            console.log(`palm pdf: section ${i} "${sb.name}" — ${sb.height}px / ${heightPt.toFixed(1)}pt (page ${pageIndex + 1} has ${remaining.toFixed(1)}pt remaining)`);
+
+            if (heightPt > usableH) {
+              // Pathologically tall section — bigger than a whole page. Start
+              // a fresh page if needed, then slice this single section across
+              // multiple pages.
+              if (cursorY > margin) {
+                pdf.addPage(); pageIndex++; paintPageBg(); cursorY = margin;
+                console.log(`palm pdf:   advancing to page ${pageIndex + 1} (oversize section)`);
+              }
+              const pxPerPage = Math.floor(fullCanvas.width * (usableH / usableW));
+              let yPx = sb.top;
+              while (yPx < sb.bottom) {
+                const stepH = Math.min(pxPerPage, sb.bottom - yPx);
+                placeSlice(yPx, yPx + stepH, stepH * pxToPt);
+                yPx += stepH;
+                if (yPx < sb.bottom) {
+                  pdf.addPage(); pageIndex++; paintPageBg(); cursorY = margin;
+                } else {
+                  cursorY += stepH * pxToPt + gap;
+                }
+              }
+              continue;
+            }
+
+            // Normal section. If it won't fit in what's left of this page,
+            // advance to a fresh one first.
+            if (heightPt > remaining && cursorY > margin) {
+              pdf.addPage(); pageIndex++; paintPageBg(); cursorY = margin;
+              console.log(`palm pdf:   advancing to page ${pageIndex + 1} (section won't fit remaining ${remaining.toFixed(1)}pt)`);
+            }
+            placeSlice(sb.top, sb.bottom, heightPt);
+            cursorY += heightPt + gap;
+          }
 
           const totalPages = pageIndex + 1;
-          pdf.save(`palm-reading-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.pdf`);
+          const fname = `palm-reading-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.pdf`;
+          pdf.save(fname);
+          console.log(`palm pdf: saved ${fname} (${totalPages} page${totalPages === 1 ? '' : 's'})`);
           toast(`Saved palm reading as PDF (${totalPages} page${totalPages === 1 ? '' : 's'})`);
         } catch (e) {
           console.error(e);
