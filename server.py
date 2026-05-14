@@ -775,6 +775,7 @@ async def palm_read(req: Request) -> dict[str, Any]:
     # or never produces output. For thinking models we drop format=json
     # and rely on the parser's <think>-strip + JSON-extract fallback.
     is_thinking = "thinking" in model.lower() or model.lower().endswith("-think")
+
     upstream_payload = {
         "model": model,
         "messages": [
@@ -2302,74 +2303,6 @@ async def _scan_stocktwits() -> list[dict]:
     return results
 
 
-async def _scan_finviz() -> list[dict]:
-    """Pull unusual volume and top gainers from Finviz via finvizfinance."""
-    results: list[dict] = []
-    try:
-        from finvizfinance.screener.overview import Overview
-    except ImportError:
-        log.info("trader: finvizfinance not installed, skipping Finviz scan")
-        return results
-
-    def _do():
-        items = []
-        try:
-            # Unusual volume (volume > 2x relative)
-            screener = Overview()
-            screener.set_filter(filters_dict={
-                "Relative Volume": "Over 2",
-                "Average Volume": "Over 500K",
-                "Price": "Over $5",
-            })
-            df = screener.screener_view()
-            if df is not None and not df.empty:
-                for _, row in df.head(20).iterrows():
-                    items.append({
-                        "ticker": str(row.get("Ticker", "")).upper(),
-                        "title": f"Unusual volume: {row.get('Company', '')}",
-                        "change_pct": row.get("Change"),
-                        "volume": row.get("Volume"),
-                        "rel_volume": row.get("Relative Volume"),
-                        "price": row.get("Price"),
-                        "source": "finviz",
-                        "signal": "unusual_volume",
-                    })
-        except Exception as e:
-            log.warning("finviz: unusual volume scan failed: %s", e)
-        try:
-            # Top gainers
-            screener2 = Overview()
-            screener2.set_filter(filters_dict={
-                "Change": "Up 5%",
-                "Average Volume": "Over 500K",
-                "Price": "Over $5",
-            })
-            df2 = screener2.screener_view()
-            if df2 is not None and not df2.empty:
-                for _, row in df2.head(15).iterrows():
-                    t = str(row.get("Ticker", "")).upper()
-                    if any(x["ticker"] == t for x in items):
-                        continue
-                    items.append({
-                        "ticker": t,
-                        "title": f"Gainer: {row.get('Company', '')} "
-                                 f"{row.get('Change', '')}",
-                        "change_pct": row.get("Change"),
-                        "volume": row.get("Volume"),
-                        "price": row.get("Price"),
-                        "source": "finviz",
-                        "signal": "gainer",
-                    })
-        except Exception as e:
-            log.warning("finviz: gainers scan failed: %s", e)
-        return items
-
-    try:
-        return await asyncio.wait_for(asyncio.to_thread(_do), timeout=20)
-    except asyncio.TimeoutError:
-        log.warning("finviz: scan timed out")
-        return results
-
 
 async def _scan_yahoo_movers() -> list[dict]:
     """Get unusual volume / top movers from yfinance."""
@@ -2581,9 +2514,9 @@ async def trader_scan(req: Request) -> dict[str, Any]:
     focus = (body.get("focus") or "").strip().lower()
     sector = (body.get("sector") or "").strip().lower()
     single_ticker = (body.get("ticker") or "").strip().upper()
-    limit = max(1, min(int(body.get("limit") or 5), 50))
+    limit = max(1, min(int(body.get("limit") or 20), 50))
     enabled_sources = (body.get("sources")
-                       or ["reddit", "stocktwits", "finviz", "yahoo"])
+                       or ["reddit", "stocktwits", "yahoo"])
     sentiment_model = (body.get("sentiment_model")
                        or TRADER_SENTIMENT_MODEL)
 
@@ -2599,8 +2532,7 @@ async def trader_scan(req: Request) -> dict[str, Any]:
         tasks["reddit"] = _scan_reddit()
     if "stocktwits" in enabled_sources:
         tasks["stocktwits"] = _scan_stocktwits()
-    if "finviz" in enabled_sources:
-        tasks["finviz"] = _scan_finviz()
+
     if "yahoo" in enabled_sources:
         tasks["yahoo"] = _scan_yahoo_movers()
 

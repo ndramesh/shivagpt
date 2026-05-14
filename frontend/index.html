@@ -2416,7 +2416,7 @@
         { name: '/kb', desc: 'Knowledge bases — list, create, ingest a folder, or delete', hasArgs: true, hint: '[list|new <name>|ingest <name> <path>|delete <name>]' },
         { name: '/ask', desc: 'Answer a question grounded in a KB (RAG)', hasArgs: true, hint: '[-kb <name>] <question>' },
         { name: '/schedule', desc: 'Recurring tasks — `add NAME when RECIPE [args]`, list, run, delete', hasArgs: true, hint: '[list|add|run|delete|on|off|view] [...]' },
-        { name: '/trader', desc: 'Social sentiment scanner — Reddit, Stocktwits, Finviz, Yahoo movers + LLM analysis', hasArgs: true, hint: '[-t NVDA] [-num 20] [-model qwen2.5:7b]' },
+        { name: '/trader', desc: 'Social sentiment scanner — Reddit, Stocktwits, Yahoo movers + LLM analysis', hasArgs: true, hint: '[-t NVDA] [-num 20] [-model qwen2.5:7b]' },
       ];
 
       const BUILT_IN_PRESETS = [
@@ -5486,7 +5486,7 @@
 
             const traderLoading = {
               role: 'system',
-              content: `*🔥 Scanning Reddit, Stocktwits, Finviz, Yahoo${traderTicker ? ' for **' + traderTicker + '**' : ''}…*\n\n_This takes 10-30 seconds (scanning 5 subreddits + LLM sentiment analysis)._`,
+              content: `*🔥 Scanning Reddit, Stocktwits, Yahoo${traderTicker ? ' for **' + traderTicker + '**' : ''}…*\n\n_This takes 10-30 seconds (scanning multiple sources + LLM sentiment analysis)._`,
               ts: Date.now(),
             };
             c.messages.push(traderLoading);
