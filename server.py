@@ -2474,7 +2474,6 @@ async def _llm_sentiment(ticker: str, posts: list[dict],
                 {"role": "user", "content": prompt},
             ],
             "stream": False,
-            "format": "json",
             "options": {"temperature": 0.3, "num_predict": 2000},
         }).encode()
 
