@@ -16,3 +16,4 @@ faster-whisper>=1.0       # /api/transcribe (voice in, CPU int8)
 piper-tts>=1.2            # /api/tts (voice out)
 schwab-py>=1.4            # /api/tp Schwab/ThinkOrSwim portfolio (OAuth2)
 markdown>=3.5             # markdown → HTML for scheduled-task email delivery
+finvizfinance>=0.14       # /api/trader Finviz screener (unusual volume, gainers)

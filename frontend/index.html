@@ -777,6 +777,151 @@
       line-height: 1.5;
     }
 
+    /* Trader Radar dashboard card */
+    .trader-card {
+      background: var(--bg-elev-1);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px 18px 14px;
+      margin: 6px 0 12px;
+    }
+    .trader-card h2, .trader-card h3 { margin: 0; }
+    .trader-card .trader-banner {
+      text-align: center;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 14px;
+    }
+    .trader-card .trader-eyebrow {
+      font-size: 11px;
+      letter-spacing: 0.22em;
+      color: var(--text-3);
+      text-transform: uppercase;
+    }
+    .trader-card .trader-title {
+      font-size: 22px;
+      letter-spacing: 0.06em;
+      font-family: Georgia, "Times New Roman", serif;
+      color: var(--text-1);
+      margin: 4px 0 2px;
+    }
+    .trader-card .trader-sub {
+      font-size: 12px;
+      color: var(--text-2);
+      font-style: italic;
+    }
+    .trader-card .trader-ticker-row {
+      padding: 12px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .trader-card .trader-ticker-row:last-child { border-bottom: none; }
+    .trader-card .trader-ticker-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      flex-wrap: wrap;
+      margin-bottom: 6px;
+    }
+    .trader-card .trader-rank {
+      font-size: 13px;
+      color: var(--text-3);
+      min-width: 28px;
+    }
+    .trader-card .trader-sym {
+      font-size: 16px;
+      font-weight: 700;
+      color: var(--text-1);
+    }
+    .trader-card .trader-badge {
+      font-size: 11px;
+      padding: 2px 8px;
+      border-radius: 10px;
+      font-weight: 600;
+    }
+    .trader-card .trader-badge.bullish {
+      background: rgba(34, 197, 94, 0.18);
+      color: #22c55e;
+    }
+    .trader-card .trader-badge.bearish {
+      background: rgba(239, 68, 68, 0.18);
+      color: #ef4444;
+    }
+    .trader-card .trader-badge.neutral {
+      background: rgba(234, 179, 8, 0.18);
+      color: #eab308;
+    }
+    .trader-card .trader-conviction-bar {
+      flex: 1;
+      min-width: 100px;
+      max-width: 200px;
+      height: 8px;
+      background: var(--bg-elev-2);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .trader-card .trader-conviction-fill {
+      height: 100%;
+      border-radius: 4px;
+      transition: width 0.5s ease;
+    }
+    .trader-card .trader-conviction-num {
+      font-size: 14px;
+      font-weight: 700;
+      min-width: 48px;
+      text-align: right;
+    }
+    .trader-card .trader-meta {
+      font-size: 12px;
+      color: var(--text-2);
+      line-height: 1.5;
+      margin-bottom: 4px;
+    }
+    .trader-card .trader-thesis {
+      font-size: 12px;
+      color: var(--text-2);
+      font-style: italic;
+      margin-top: 4px;
+      padding: 6px 10px;
+      background: var(--bg-elev-2);
+      border-radius: 6px;
+      border-left: 3px solid var(--accent, #7c5cff);
+    }
+    .trader-card .trader-posts {
+      font-size: 11px;
+      color: var(--text-3);
+      margin-top: 6px;
+    }
+    .trader-card .trader-posts a {
+      color: var(--accent, #7c5cff);
+      text-decoration: none;
+    }
+    .trader-card .trader-posts a:hover { text-decoration: underline; }
+    .trader-card .trader-footer {
+      margin-top: 14px;
+      padding-top: 12px;
+      border-top: 1px solid var(--border);
+      font-size: 11px;
+      color: var(--text-3);
+      text-align: center;
+    }
+    .trader-card .trader-actions {
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      margin-top: 10px;
+    }
+    .trader-card .trader-action-btn {
+      background: var(--bg-elev-2);
+      color: var(--text-1);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 14px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: background var(--transition);
+    }
+    .trader-card .trader-action-btn:hover { background: var(--bg-hover); }
+
     /* Inline price chart on /stock and /watchlist messages */
     .msg-chart-wrap {
       position: relative;
@@ -2271,6 +2416,7 @@
         { name: '/kb', desc: 'Knowledge bases — list, create, ingest a folder, or delete', hasArgs: true, hint: '[list|new <name>|ingest <name> <path>|delete <name>]' },
         { name: '/ask', desc: 'Answer a question grounded in a KB (RAG)', hasArgs: true, hint: '[-kb <name>] <question>' },
         { name: '/schedule', desc: 'Recurring tasks — `add NAME when RECIPE [args]`, list, run, delete', hasArgs: true, hint: '[list|add|run|delete|on|off|view] [...]' },
+        { name: '/trader', desc: 'Social sentiment scanner — Reddit, Stocktwits, Finviz, Yahoo movers + LLM analysis', hasArgs: true, hint: '[-ticker NVDA] [-limit 15]' },
       ];
 
       const BUILT_IN_PRESETS = [
@@ -5310,8 +5456,190 @@
             }
             break;
           }
+
+          case '/trader': {
+            if (!c) c = newConvo();
+            // Parse optional flags: -ticker NVDA, -limit 15
+            let traderTicker = '';
+            let traderLimit = 15;
+            const traderArgs = (args || '').trim();
+            if (traderArgs) {
+              const tParts = traderArgs.split(/\s+/);
+              for (let ti = 0; ti < tParts.length; ti++) {
+                if ((tParts[ti] === '-ticker' || tParts[ti] === '-t') && tParts[ti+1]) {
+                  traderTicker = tParts[++ti].toUpperCase();
+                } else if ((tParts[ti] === '-limit' || tParts[ti] === '-l') && tParts[ti+1]) {
+                  traderLimit = parseInt(tParts[++ti]) || 15;
+                }
+              }
+            }
+
+            c.messages.push({ role: 'user', content: `/trader${traderArgs ? ' ' + traderArgs : ''}`, ts: Date.now() });
+            autoTitleFromFirstUserMsg(c);
+            c.updatedAt = Date.now();
+            persistAll();
+            renderSidebar();
+            renderActive();
+
+            const traderLoading = {
+              role: 'system',
+              content: `*🔥 Scanning Reddit, Stocktwits, Finviz, Yahoo${traderTicker ? ' for **' + traderTicker + '**' : ''}…*\n\n_This takes 10-30 seconds (scanning 5 subreddits + LLM sentiment analysis)._`,
+              ts: Date.now(),
+            };
+            c.messages.push(traderLoading);
+            persistAll();
+            renderActive();
+            scrollToBottom();
+
+            try {
+              const trBody = { limit: traderLimit };
+              if (traderTicker) trBody.ticker = traderTicker;
+
+              const tr = await fetch(apiUrl('/api/trader'), {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify(trBody),
+              });
+              if (!tr.ok) {
+                let detail = '';
+                try { const j = await tr.json(); detail = j.detail || JSON.stringify(j); }
+                catch { detail = await tr.text(); }
+                throw new Error(detail || ('HTTP ' + tr.status));
+              }
+              const trData = await tr.json();
+              const traderHtml = renderTraderDashboard(trData);
+              const ti = c.messages.indexOf(traderLoading);
+              if (ti >= 0) {
+                c.messages[ti].content = traderHtml;
+                persistAll();
+                renderActive();
+                scrollToBottom();
+              }
+            } catch (e) {
+              console.error(e);
+              const ti = c.messages.indexOf(traderLoading);
+              if (ti >= 0) {
+                c.messages[ti].content = `*Trader scan failed: ${(e.message || e).toString().slice(0, 400)}*`;
+                persistAll();
+                renderActive();
+              }
+              toast('Trader scan failed');
+            }
+            break;
+          }
         }
         return true;
+      }
+
+      // Render the /trader response into a styled dashboard card.
+      function renderTraderDashboard(data) {
+        const esc = (s) => (s == null ? '' : String(s)
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+        const fmtMoney = (v) => v == null ? '' : '$' + Number(v).toLocaleString(undefined, { maximumFractionDigits: 2 });
+        const fmtPct = (v) => v == null ? '' : (v >= 0 ? '+' : '') + Number(v).toFixed(2) + '%';
+        const fmtBig = (v) => {
+          if (v == null) return '';
+          const n = Math.abs(v);
+          if (n >= 1e12) return (v / 1e12).toFixed(1) + 'T';
+          if (n >= 1e9) return (v / 1e9).toFixed(1) + 'B';
+          if (n >= 1e6) return (v / 1e6).toFixed(1) + 'M';
+          if (n >= 1e3) return (v / 1e3).toFixed(1) + 'K';
+          return String(v);
+        };
+
+        const tickers = data.tickers || [];
+        const sources = data.sources || [];
+        const scanTime = data.scan_seconds || 0;
+        const totalMentions = data.total_mentions || 0;
+        const uniqueTickers = data.unique_tickers || 0;
+        const genDate = new Date().toLocaleString('en-US', {
+          month: 'short', day: 'numeric', year: 'numeric',
+          hour: 'numeric', minute: '2-digit',
+        });
+
+        // Conviction bar color based on score
+        const barColor = (score) => {
+          if (score >= 75) return '#22c55e';
+          if (score >= 55) return '#3b82f6';
+          if (score >= 40) return '#eab308';
+          return '#ef4444';
+        };
+
+        // Sentiment emoji
+        const sentEmoji = (s) => s === 'bullish' ? '🟢' : s === 'bearish' ? '🔴' : '🟡';
+
+        let tickerRows = '';
+        tickers.forEach((t, i) => {
+          const priceLine = [
+            t.price ? fmtMoney(t.price) : '',
+            t.change_pct != null ? fmtPct(t.change_pct) : '',
+            t.vol_ratio ? `Vol ${t.vol_ratio}x` : '',
+            t.market_cap ? `Cap ${fmtBig(t.market_cap)}` : '',
+          ].filter(Boolean).join(' · ');
+
+          const srcLine = [
+            t.mention_count ? `${t.mention_count} mentions` : '',
+            t.sources && t.sources.length ? t.sources.join(', ') : '',
+            t.total_engagement ? `${fmtBig(t.total_engagement)} engagement` : '',
+          ].filter(Boolean).join(' · ');
+
+          const signals = (t.signals || []).map(s =>
+            s === 'unusual_volume' ? '📊 Unusual Vol' :
+            s === 'gainer' ? '📈 Gainer' :
+            s === 'most_actives' ? '🔥 Most Active' :
+            s === 'day_gainers' ? '📈 Day Gainer' :
+            s === 'day_losers' ? '📉 Day Loser' : s
+          );
+
+          let postsHtml = '';
+          if (t.top_posts && t.top_posts.length) {
+            postsHtml = '<div class="trader-posts">' +
+              t.top_posts.slice(0, 3).map(p => {
+                const src = p.sub ? `r/${p.sub}` : p.source;
+                const link = p.url ? `<a href="${esc(p.url)}" target="_blank" rel="noopener">${esc(p.title.slice(0, 80))}</a>` : esc(p.title.slice(0, 80));
+                return `${link} <span style="opacity:0.6">(${src} · ↑${p.score})</span>`;
+              }).join('<br>') +
+            '</div>';
+          }
+
+          tickerRows += [
+            `<div class="trader-ticker-row">`,
+            `<div class="trader-ticker-header">`,
+            `<span class="trader-rank">#${i + 1}</span>`,
+            `<span class="trader-sym">${esc(t.ticker)}</span>`,
+            `<span class="trader-badge ${esc(t.sentiment)}">${sentEmoji(t.sentiment)} ${esc(t.sentiment)}</span>`,
+            `<div class="trader-conviction-bar"><div class="trader-conviction-fill" style="width:${t.conviction}%;background:${barColor(t.conviction)}"></div></div>`,
+            `<span class="trader-conviction-num" style="color:${barColor(t.conviction)}">${t.conviction}/100</span>`,
+            `</div>`,
+            priceLine ? `<div class="trader-meta">${esc(priceLine)}</div>` : '',
+            srcLine ? `<div class="trader-meta">${esc(srcLine)}</div>` : '',
+            signals.length ? `<div class="trader-meta">${signals.join(' · ')}</div>` : '',
+            t.thesis ? `<div class="trader-thesis">🤖 ${esc(t.thesis)}</div>` : '',
+            postsHtml,
+            `</div>`,
+          ].join('\n');
+        });
+
+        if (!tickers.length) {
+          tickerRows = '<div style="text-align:center;padding:20px;color:var(--text-3)">No trending tickers found. Markets may be closed or sources unreachable.</div>';
+        }
+
+        return [
+'<div class="trader-card">',
+'<div class="trader-banner">',
+'<div class="trader-eyebrow">Social Sentiment Scanner</div>',
+'<div class="trader-title">🔥 TRADER RADAR</div>',
+`<div class="trader-sub">Scanned ${sources.length} source${sources.length === 1 ? '' : 's'} · ${totalMentions} mentions · ${uniqueTickers} unique tickers · ${scanTime}s</div>`,
+'</div>',
+tickerRows,
+'<div class="trader-footer">',
+`Sources: ${sources.join(', ') || 'none'} · Generated by ShivaGPT on ${esc(genDate)}`,
+'</div>',
+'<div class="trader-actions">',
+'<button class="trader-action-btn" onclick="document.querySelector(\'#composer textarea\').value=\'/trader\';document.querySelector(\'#composer textarea\').focus()" type="button">🔄 Rescan</button>',
+'</div>',
+'</div>',
+        ].join('\n');
       }
 
       // Render a stock dashboard as a single markdown blob. Kept inline as

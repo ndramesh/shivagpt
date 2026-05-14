@@ -2129,6 +2129,615 @@ async def tp_portfolio(req: Request) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Social Sentiment Scanner (/api/trader)
+#
+# Aggregates stock mentions and sentiment from Reddit (r/wallstreetbets,
+# r/stocks, r/investing, r/options, r/stockmarket), Stocktwits trending,
+# Finviz screener, and Yahoo Finance unusual movers.  Extracts tickers,
+# counts mentions, runs LLM sentiment analysis, cross-references with
+# existing /stock technicals, and returns a scored & ranked list.
+#
+# NOT financial advice.  Social media sentiment can be manipulated — this
+# is a research/entertainment tool only.
+# ---------------------------------------------------------------------------
+
+TRADER_DISCLAIMER = (
+    "_Social sentiment aggregated from Reddit, Stocktwits, Finviz, and "
+    "Yahoo Finance. This is NOT financial advice and NOT a recommendation "
+    "to trade. Social media sentiment can be manipulated. Always do your "
+    "own research._"
+)
+
+# Subreddits to scan — ordered by signal quality.
+_REDDIT_SUBS = ["wallstreetbets", "stocks", "investing", "options", "stockmarket"]
+
+# Common words that look like tickers but aren't.
+_TICKER_BLACKLIST = {
+    "I", "A", "AM", "PM", "CEO", "CFO", "CTO", "COO", "IPO", "ETF", "ATH",
+    "ATL", "DD", "IMO", "YOLO", "FOMO", "FYI", "EPS", "GDP", "CPI", "PPI",
+    "RSI", "MACD", "PE", "PS", "PB", "EV", "AI", "API", "IT", "UK", "US",
+    "USA", "EU", "SEC", "FDA", "FED", "FDIC", "FOMC", "IV", "DTE", "OTM",
+    "ITM", "ATM", "OI", "EOD", "AH", "ER", "PT", "SP", "QE", "QT",
+    "YTD", "QOQ", "MOM", "WOW", "DOW", "LOL", "WTF", "OMG", "TBH",
+    "TLDR", "PSA", "LFG", "NFT", "RIP", "PDT", "IRA", "ETH", "BTC", "USD",
+    "EUR", "GBP", "JPY", "CAD", "AUD", "FOR", "THE", "AND",
+    "NEW", "ALL", "ANY", "ARE", "CAN", "HAS", "NOW", "ONE", "OUR", "OUT",
+    "TWO", "WAY", "WHO", "BIG", "TOP", "LOW", "RED", "RUN", "SAW", "SEE",
+    "SET", "TRY", "BUY", "PUT", "CALL", "LONG", "SHORT", "BEAR", "BULL",
+    "PUMP", "DUMP", "HOLD", "SELL", "GAIN", "LOSS", "MOON", "DIPS", "BAGS",
+    "CASH", "DEBT", "LOAN", "BOND", "RISK", "SAFE", "REAL", "GOOD", "BEST",
+    "FREE", "JUST", "LIKE", "VERY", "MOST", "MUCH", "MANY", "SOME", "ONLY",
+    "ALSO", "BACK", "OVER", "EVEN", "MORE", "THAN", "THEN", "THEY", "BEEN",
+    "HAVE", "FROM", "THIS", "THAT", "WITH", "WILL", "WHAT", "WHEN",
+    "YOUR", "INTO", "MAKE", "TAKE", "COME", "KNOW", "WANT", "GIVE",
+    "FIND", "HERE", "YEAR", "LAST", "NEXT", "EACH", "HIGH", "OPEN", "HOPE",
+    "HUGE", "SAVE", "EDIT", "LINK", "POST", "SURE", "ZERO", "HALF", "PURE",
+    "FAST", "SLOW", "EASY", "HARD", "TRUE", "FAKE", "MATH", "SIGN",
+}
+
+# Regex for $TICKER or plain TICKER (2-5 uppercase letters).
+_TICKER_RE = re.compile(r"\$([A-Z]{2,5})\b")
+_PLAIN_TICKER_RE = re.compile(r"\b([A-Z]{2,5})\b")
+
+TRADER_SENTIMENT_MODEL = os.getenv("TRADER_SENTIMENT_MODEL", "qwen3:8b")
+
+
+def _extract_tickers(text: str) -> list[str]:
+    """Pull stock tickers from text.  Prefers $AAPL style, falls back to
+    plain uppercase.  Deduplicates and filters blacklisted words."""
+    found = set()
+    # $TICKER is high confidence
+    for m in _TICKER_RE.finditer(text):
+        t = m.group(1).upper()
+        if t not in _TICKER_BLACKLIST:
+            found.add(t)
+    # Plain uppercase only if we got nothing from $ prefix
+    if not found:
+        for m in _PLAIN_TICKER_RE.finditer(text):
+            t = m.group(1).upper()
+            if t not in _TICKER_BLACKLIST and len(t) >= 2:
+                found.add(t)
+    return list(found)
+
+
+async def _scan_reddit(subreddits: list[str] | None = None,
+                       limit: int = 50) -> list[dict]:
+    """Scan Reddit subreddits via the public JSON API (no auth).
+
+    Returns [{ticker, title, score, comments, sub, url, text}].
+    """
+    subs = subreddits or _REDDIT_SUBS
+    results: list[dict] = []
+    timeout = httpx.Timeout(connect=8.0, read=15.0, write=5.0, pool=5.0)
+    headers = {"User-Agent": "ShivaGPT/1.0 (social sentiment scanner)"}
+
+    async with httpx.AsyncClient(timeout=timeout, headers=headers) as cli:
+        for sub in subs:
+            try:
+                r = await cli.get(
+                    f"https://www.reddit.com/r/{sub}/hot.json",
+                    params={"limit": str(min(limit, 100)), "raw_json": "1"},
+                )
+                if r.status_code != 200:
+                    log.warning("reddit: r/%s returned %d", sub, r.status_code)
+                    continue
+                data = r.json()
+                posts = data.get("data", {}).get("children", [])
+                for p in posts:
+                    d = p.get("data", {})
+                    title = d.get("title", "")
+                    selftext = (d.get("selftext") or "")[:500]
+                    full_text = f"{title} {selftext}"
+                    tickers = _extract_tickers(full_text)
+                    if not tickers:
+                        continue
+                    for ticker in tickers:
+                        results.append({
+                            "ticker": ticker,
+                            "title": title[:200],
+                            "score": d.get("score", 0),
+                            "comments": d.get("num_comments", 0),
+                            "sub": sub,
+                            "url": f"https://reddit.com{d.get('permalink', '')}",
+                            "text": selftext[:300],
+                            "source": "reddit",
+                            "created": d.get("created_utc", 0),
+                        })
+            except Exception as e:
+                log.warning("reddit: r/%s scan failed: %s", sub, e)
+    return results
+
+
+async def _scan_stocktwits() -> list[dict]:
+    """Get trending tickers + sentiment from Stocktwits API (free, no key)."""
+    results: list[dict] = []
+    timeout = httpx.Timeout(connect=8.0, read=15.0, write=5.0, pool=5.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as cli:
+            r = await cli.get(
+                "https://api.stocktwits.com/api/2/trending/symbols.json",
+            )
+            if r.status_code != 200:
+                log.warning("stocktwits: trending returned %d", r.status_code)
+                return results
+            data = r.json()
+            symbols = data.get("symbols", [])
+            for s in symbols:
+                ticker = s.get("symbol", "").upper()
+                if not ticker or ticker in _TICKER_BLACKLIST:
+                    continue
+                results.append({
+                    "ticker": ticker,
+                    "title": s.get("title", ticker),
+                    "watchlist_count": s.get("watchlist_count", 0),
+                    "source": "stocktwits",
+                })
+    except Exception as e:
+        log.warning("stocktwits: scan failed: %s", e)
+    return results
+
+
+async def _scan_finviz() -> list[dict]:
+    """Pull unusual volume and top gainers from Finviz via finvizfinance."""
+    results: list[dict] = []
+    try:
+        from finvizfinance.screener.overview import Overview
+    except ImportError:
+        log.info("trader: finvizfinance not installed, skipping Finviz scan")
+        return results
+
+    def _do():
+        items = []
+        try:
+            # Unusual volume (volume > 2x relative)
+            screener = Overview()
+            screener.set_filter(filters_dict={
+                "Relative Volume": "Over 2",
+                "Average Volume": "Over 500K",
+                "Price": "Over $5",
+            })
+            df = screener.screener_view()
+            if df is not None and not df.empty:
+                for _, row in df.head(20).iterrows():
+                    items.append({
+                        "ticker": str(row.get("Ticker", "")).upper(),
+                        "title": f"Unusual volume: {row.get('Company', '')}",
+                        "change_pct": row.get("Change"),
+                        "volume": row.get("Volume"),
+                        "rel_volume": row.get("Relative Volume"),
+                        "price": row.get("Price"),
+                        "source": "finviz",
+                        "signal": "unusual_volume",
+                    })
+        except Exception as e:
+            log.warning("finviz: unusual volume scan failed: %s", e)
+        try:
+            # Top gainers
+            screener2 = Overview()
+            screener2.set_filter(filters_dict={
+                "Change": "Up 5%",
+                "Average Volume": "Over 500K",
+                "Price": "Over $5",
+            })
+            df2 = screener2.screener_view()
+            if df2 is not None and not df2.empty:
+                for _, row in df2.head(15).iterrows():
+                    t = str(row.get("Ticker", "")).upper()
+                    if any(x["ticker"] == t for x in items):
+                        continue
+                    items.append({
+                        "ticker": t,
+                        "title": f"Gainer: {row.get('Company', '')} "
+                                 f"{row.get('Change', '')}",
+                        "change_pct": row.get("Change"),
+                        "volume": row.get("Volume"),
+                        "price": row.get("Price"),
+                        "source": "finviz",
+                        "signal": "gainer",
+                    })
+        except Exception as e:
+            log.warning("finviz: gainers scan failed: %s", e)
+        return items
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_do), timeout=20)
+    except asyncio.TimeoutError:
+        log.warning("finviz: scan timed out")
+        return results
+
+
+async def _scan_yahoo_movers() -> list[dict]:
+    """Get unusual volume / top movers from yfinance."""
+    results: list[dict] = []
+    yf = _yfinance_or_none()
+    if yf is None:
+        return results
+
+    def _do():
+        items = []
+        try:
+            import yfinance as _yf
+            for screen_id in ["most_actives", "day_gainers", "day_losers"]:
+                try:
+                    screener = _yf.Screener()
+                    screener.set_default_body(screen_id)
+                    response = screener.response
+                    quotes = []
+                    if isinstance(response, dict):
+                        fin = response.get("finance", {})
+                        results_list = fin.get("result", [])
+                        if results_list:
+                            quotes = results_list[0].get("quotes", [])
+                    for q in quotes[:10]:
+                        ticker = (q.get("symbol") or "").upper()
+                        if not ticker or ticker in _TICKER_BLACKLIST:
+                            continue
+                        avg_vol = q.get("averageDailyVolume3Month", 0)
+                        cur_vol = q.get("regularMarketVolume", 0)
+                        vol_ratio = (cur_vol / avg_vol) if avg_vol else 0
+                        items.append({
+                            "ticker": ticker,
+                            "title": q.get("shortName", ticker),
+                            "price": q.get("regularMarketPrice"),
+                            "change_pct": q.get(
+                                "regularMarketChangePercent"),
+                            "volume": cur_vol,
+                            "avg_volume": avg_vol,
+                            "vol_ratio": round(vol_ratio, 2),
+                            "market_cap": q.get("marketCap"),
+                            "source": "yahoo",
+                            "signal": screen_id,
+                        })
+                except Exception as e:
+                    log.debug("yahoo screener %s failed: %s", screen_id, e)
+        except Exception as e:
+            log.warning("yahoo movers failed: %s", e)
+        return items
+
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(_do), timeout=20)
+    except asyncio.TimeoutError:
+        log.warning("yahoo movers timed out")
+        return results
+
+
+async def _llm_sentiment(ticker: str, posts: list[dict],
+                         model: str | None = None) -> dict:
+    """Ask the local LLM to analyze sentiment from collected posts.
+
+    Returns {sentiment, confidence, thesis, rating}.
+    """
+    model = model or TRADER_SENTIMENT_MODEL
+    if not posts:
+        return {"sentiment": "neutral", "confidence": 0.3,
+                "thesis": "Insufficient data", "rating": 50}
+
+    # Build a digest of the top posts (by score) for the LLM
+    sorted_posts = sorted(
+        posts, key=lambda p: p.get("score", 0), reverse=True)
+    digest = "\n".join(
+        f"- [{p.get('source','?')}] (score:{p.get('score',0)}) "
+        f"{p.get('title','')}"
+        + (f" | {p.get('text','')[:150]}" if p.get("text") else "")
+        for p in sorted_posts[:15]
+    )
+
+    prompt = (
+        f"Analyze the social media sentiment for ${ticker} based on "
+        f"these posts:\n\n{digest}\n\n"
+        "Return ONLY valid JSON, no markdown fences:\n"
+        "{\n"
+        '  "sentiment": "bullish" | "bearish" | "neutral",\n'
+        '  "confidence": 0.0 to 1.0,\n'
+        '  "thesis": "1-2 sentence summary of why people are talking '
+        'about it",\n'
+        '  "rating": 0 to 100 (50=neutral, 100=extremely bullish, '
+        '0=extremely bearish)\n'
+        "}"
+    )
+
+    try:
+        payload = json.dumps({
+            "model": model,
+            "messages": [
+                {"role": "system", "content":
+                 "You are a financial sentiment analyst. Analyze social "
+                 "media posts about stocks and determine the overall "
+                 "sentiment. Be objective and factor in post engagement "
+                 "(scores). This is for research only, not financial "
+                 "advice."},
+                {"role": "user", "content": prompt},
+            ],
+            "stream": False,
+            "format": "json",
+            "options": {"temperature": 0.3, "num_predict": 300},
+        }).encode()
+
+        timeout = httpx.Timeout(
+            connect=5.0, read=30.0, write=5.0, pool=5.0)
+        async with httpx.AsyncClient(timeout=timeout) as cli:
+            r = await cli.post(
+                f"{OLLAMA_URL}/api/chat",
+                content=payload,
+                headers={"content-type": "application/json"},
+            )
+        if r.status_code != 200:
+            log.warning("trader llm: %s returned %d", model, r.status_code)
+            return {"sentiment": "neutral", "confidence": 0.3,
+                    "thesis": "LLM unavailable", "rating": 50}
+
+        raw = (r.json().get("message") or {}).get("content", "")
+        # Strip thinking blocks if present
+        raw = re.sub(r"<think>[\s\S]*?</think>\s*", "", raw,
+                     flags=re.IGNORECASE)
+        raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(),
+                     flags=re.IGNORECASE)
+        raw = re.sub(r"\s*```\s*$", "", raw)
+
+        result = json.loads(raw)
+        result["sentiment"] = str(
+            result.get("sentiment", "neutral")).lower()
+        result["confidence"] = max(0.0, min(1.0, float(
+            result.get("confidence", 0.5))))
+        result["rating"] = max(0, min(100, int(
+            result.get("rating", 50))))
+        return result
+    except Exception as e:
+        log.warning("trader llm sentiment for %s failed: %s", ticker, e)
+        return {"sentiment": "neutral", "confidence": 0.3,
+                "thesis": "Analysis failed", "rating": 50}
+
+
+def _compute_conviction(ticker_data: dict) -> int:
+    """Compute a 0-100 conviction score from aggregated ticker data."""
+    import math
+    mention_count = ticker_data.get("mention_count", 0)
+    source_count = len(ticker_data.get("sources", []))
+    sentiment_rating = ticker_data.get("sentiment", {}).get("rating", 50)
+    vol_ratio = ticker_data.get("vol_ratio") or 1.0
+    change_pct = abs(ticker_data.get("change_pct") or 0)
+
+    # Mention score: logarithmic
+    mention_score = min(100, int(25 * math.log2(max(1, mention_count)) + 5))
+    # Source diversity: more sources = higher confidence
+    diversity_score = min(100, source_count * 25)
+    # Volume anomaly score
+    if vol_ratio >= 5:
+        volume_score = 100
+    elif vol_ratio >= 3:
+        volume_score = 80
+    elif vol_ratio >= 2:
+        volume_score = 60
+    elif vol_ratio >= 1.5:
+        volume_score = 40
+    else:
+        volume_score = 20
+    # Price movement score
+    move_score = min(100, int(change_pct * 10))
+
+    score = int(
+        mention_score    * 0.25 +
+        sentiment_rating * 0.30 +
+        volume_score     * 0.20 +
+        diversity_score  * 0.15 +
+        move_score       * 0.10
+    )
+    return max(0, min(100, score))
+
+
+@app.post("/api/trader")
+async def trader_scan(req: Request) -> dict[str, Any]:
+    """Scan social media + market data for trending tickers.
+
+    Body: {
+        focus?: "momentum" | "options" | "value" | "earnings",
+        sector?: str,
+        ticker?: str,            # deep dive on one ticker
+        limit?: int,             # max tickers to return (default 15)
+        sources?: list[str],     # ["reddit","stocktwits","finviz","yahoo"]
+        sentiment_model?: str,   # Ollama model for sentiment
+    }
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        body = {}
+
+    focus = (body.get("focus") or "").strip().lower()
+    sector = (body.get("sector") or "").strip().lower()
+    single_ticker = (body.get("ticker") or "").strip().upper()
+    limit = max(1, min(int(body.get("limit") or 15), 50))
+    enabled_sources = (body.get("sources")
+                       or ["reddit", "stocktwits", "finviz", "yahoo"])
+    sentiment_model = (body.get("sentiment_model")
+                       or TRADER_SENTIMENT_MODEL)
+
+    t0 = time.monotonic()
+    log.info("trader: scan starting focus=%r sector=%r ticker=%r "
+             "sources=%s", focus, sector, single_ticker, enabled_sources)
+
+    # ------------------------------------------------------------------
+    # 1. Collect data from all sources in parallel
+    # ------------------------------------------------------------------
+    tasks = {}
+    if "reddit" in enabled_sources:
+        tasks["reddit"] = _scan_reddit()
+    if "stocktwits" in enabled_sources:
+        tasks["stocktwits"] = _scan_stocktwits()
+    if "finviz" in enabled_sources:
+        tasks["finviz"] = _scan_finviz()
+    if "yahoo" in enabled_sources:
+        tasks["yahoo"] = _scan_yahoo_movers()
+
+    raw_results = await asyncio.gather(
+        *tasks.values(), return_exceptions=True)
+    source_names = list(tasks.keys())
+
+    all_items: list[dict] = []
+    sources_ok: list[str] = []
+    for name, result in zip(source_names, raw_results):
+        if isinstance(result, Exception):
+            log.warning("trader: %s failed: %s", name, result)
+        elif result:
+            all_items.extend(result)
+            sources_ok.append(name)
+            log.info("trader: %s returned %d items", name, len(result))
+
+    if not all_items:
+        return {
+            "tickers": [],
+            "sources": sources_ok,
+            "scan_seconds": round(time.monotonic() - t0, 2),
+            "disclaimer": TRADER_DISCLAIMER,
+            "error": "No data returned from any source.",
+        }
+
+    # ------------------------------------------------------------------
+    # 2. Aggregate by ticker
+    # ------------------------------------------------------------------
+    from collections import defaultdict
+    ticker_agg: dict[str, dict] = defaultdict(lambda: {
+        "ticker": "", "mention_count": 0, "total_score": 0,
+        "total_comments": 0, "sources": set(), "posts": [],
+        "price": None, "change_pct": None, "vol_ratio": None,
+        "volume": None, "avg_volume": None, "market_cap": None,
+        "signals": [],
+    })
+
+    for item in all_items:
+        ticker = item.get("ticker", "").upper()
+        if not ticker or len(ticker) < 2:
+            continue
+        if single_ticker and ticker != single_ticker:
+            continue
+
+        agg = ticker_agg[ticker]
+        agg["ticker"] = ticker
+        agg["mention_count"] += 1
+        agg["sources"].add(item.get("source", "?"))
+        agg["total_score"] += item.get("score", 0)
+        agg["total_comments"] += item.get("comments", 0)
+
+        if len(agg["posts"]) < 20:
+            agg["posts"].append(item)
+
+        # Merge price/volume data (first-write wins)
+        if item.get("price") and agg["price"] is None:
+            agg["price"] = item["price"]
+        if item.get("change_pct") is not None and agg["change_pct"] is None:
+            try:
+                v = item["change_pct"]
+                if isinstance(v, str):
+                    v = float(v.replace("%", "").replace("+", ""))
+                agg["change_pct"] = float(v)
+            except (ValueError, TypeError):
+                pass
+        if item.get("vol_ratio") and (
+                agg["vol_ratio"] is None
+                or item["vol_ratio"] > agg["vol_ratio"]):
+            agg["vol_ratio"] = item["vol_ratio"]
+        if item.get("volume"):
+            agg["volume"] = item["volume"]
+        if item.get("avg_volume"):
+            agg["avg_volume"] = item["avg_volume"]
+        if item.get("market_cap"):
+            agg["market_cap"] = item["market_cap"]
+        if item.get("signal"):
+            agg["signals"].append(item["signal"])
+
+    if not ticker_agg:
+        return {
+            "tickers": [], "sources": sources_ok,
+            "total_mentions": len(all_items),
+            "scan_seconds": round(time.monotonic() - t0, 2),
+            "disclaimer": TRADER_DISCLAIMER,
+        }
+
+    # ------------------------------------------------------------------
+    # 3. Pre-sort and pick top N candidates by mention count
+    # ------------------------------------------------------------------
+    candidates = sorted(
+        ticker_agg.values(),
+        key=lambda x: x["mention_count"], reverse=True,
+    )[:limit]
+
+    # ------------------------------------------------------------------
+    # 4. LLM sentiment analysis for top candidates (parallel)
+    # ------------------------------------------------------------------
+    sentiments = await asyncio.gather(*(
+        _llm_sentiment(c["ticker"], c["posts"], model=sentiment_model)
+        for c in candidates
+    ), return_exceptions=True)
+    for cand, sent in zip(candidates, sentiments):
+        if isinstance(sent, Exception):
+            cand["sentiment"] = {
+                "sentiment": "neutral", "confidence": 0.3,
+                "thesis": "Analysis error", "rating": 50,
+            }
+        else:
+            cand["sentiment"] = sent
+
+    # ------------------------------------------------------------------
+    # 5. Compute conviction scores and final ranking
+    # ------------------------------------------------------------------
+    for cand in candidates:
+        cand["conviction"] = _compute_conviction(cand)
+    candidates.sort(key=lambda x: x["conviction"], reverse=True)
+
+    # ------------------------------------------------------------------
+    # 6. Build response
+    # ------------------------------------------------------------------
+    tickers_out = []
+    for cand in candidates:
+        sentiment = cand.get("sentiment", {})
+        top_posts = sorted(
+            cand.get("posts", []),
+            key=lambda p: p.get("score", 0), reverse=True,
+        )[:5]
+        tickers_out.append({
+            "ticker": cand["ticker"],
+            "conviction": cand["conviction"],
+            "mention_count": cand["mention_count"],
+            "sources": sorted(cand.get("sources", set())),
+            "sentiment": sentiment.get("sentiment", "neutral"),
+            "sentiment_confidence": sentiment.get("confidence", 0),
+            "sentiment_rating": sentiment.get("rating", 50),
+            "thesis": sentiment.get("thesis", ""),
+            "price": cand.get("price"),
+            "change_pct": cand.get("change_pct"),
+            "vol_ratio": cand.get("vol_ratio"),
+            "volume": cand.get("volume"),
+            "avg_volume": cand.get("avg_volume"),
+            "market_cap": cand.get("market_cap"),
+            "signals": list(set(cand.get("signals", []))),
+            "total_engagement": (cand.get("total_score", 0)
+                                 + cand.get("total_comments", 0)),
+            "top_posts": [{
+                "title": p.get("title", "")[:200],
+                "source": p.get("source", ""),
+                "sub": p.get("sub", ""),
+                "score": p.get("score", 0),
+                "comments": p.get("comments", 0),
+                "url": p.get("url", ""),
+            } for p in top_posts],
+        })
+
+    scan_time = round(time.monotonic() - t0, 2)
+    log.info("trader: done in %.1fs — %d tickers, %d mentions, src=%s",
+             scan_time, len(tickers_out), len(all_items), sources_ok)
+
+    return {
+        "tickers": tickers_out,
+        "sources": sources_ok,
+        "total_mentions": len(all_items),
+        "unique_tickers": len(ticker_agg),
+        "scan_seconds": scan_time,
+        "sentiment_model": sentiment_model,
+        "disclaimer": TRADER_DISCLAIMER,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Voice input (/api/transcribe) — faster-whisper STT
 # ---------------------------------------------------------------------------
 
