@@ -2581,7 +2581,7 @@ async def trader_scan(req: Request) -> dict[str, Any]:
     focus = (body.get("focus") or "").strip().lower()
     sector = (body.get("sector") or "").strip().lower()
     single_ticker = (body.get("ticker") or "").strip().upper()
-    limit = max(1, min(int(body.get("limit") or 15), 50))
+    limit = max(1, min(int(body.get("limit") or 5), 50))
     enabled_sources = (body.get("sources")
                        or ["reddit", "stocktwits", "finviz", "yahoo"])
     sentiment_model = (body.get("sentiment_model")
@@ -2697,12 +2697,18 @@ async def trader_scan(req: Request) -> dict[str, Any]:
     )[:limit]
 
     # ------------------------------------------------------------------
-    # 4. LLM sentiment analysis for top candidates (parallel)
+    # 4. LLM sentiment analysis for top candidates (parallel but limited)
     # ------------------------------------------------------------------
+    sem = asyncio.Semaphore(2)  # Prevent crushing Ollama with 15 parallel reasoning requests
+    
+    async def _safe_sentiment(c):
+        async with sem:
+            return await _llm_sentiment(c["ticker"], c["posts"], model=sentiment_model)
+
     sentiments = await asyncio.gather(*(
-        _llm_sentiment(c["ticker"], c["posts"], model=sentiment_model)
-        for c in candidates
+        _safe_sentiment(c) for c in candidates
     ), return_exceptions=True)
+    
     for cand, sent in zip(candidates, sentiments):
         if isinstance(sent, Exception):
             cand["sentiment"] = {

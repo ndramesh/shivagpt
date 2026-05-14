@@ -5459,9 +5459,9 @@
 
           case '/trader': {
             if (!c) c = newConvo();
-            // Parse optional flags: -ticker NVDA, -limit 15
+            // Parse optional flags: -ticker NVDA, -limit 5
             let traderTicker = '';
-            let traderLimit = 15;
+            let traderLimit = 5;
             const traderArgs = (args || '').trim();
             if (traderArgs) {
               const tParts = traderArgs.split(/\s+/);
@@ -5469,7 +5469,7 @@
                 if ((tParts[ti] === '-ticker' || tParts[ti] === '-t') && tParts[ti+1]) {
                   traderTicker = tParts[++ti].toUpperCase();
                 } else if ((tParts[ti] === '-limit' || tParts[ti] === '-l') && tParts[ti+1]) {
-                  traderLimit = parseInt(tParts[++ti]) || 15;
+                  traderLimit = parseInt(tParts[++ti]) || 5;
                 }
               }
             }
