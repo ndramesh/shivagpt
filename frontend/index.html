@@ -5343,15 +5343,17 @@
         const disclaimer = meta.disclaimer ||
           'For entertainment. Palmistry has no scientific basis.';
 
+        // Each top-level chunk is wrapped in `.palm-section` so the PDF
+        // exporter can pack them as atomic units (no mid-section breaks).
         return `
 <div class="palm-card">
-  <div class="palm-banner">
+  <div class="palm-section palm-banner">
     <div class="palm-eyebrow">${personName ? 'Personalized for ' + esc(personName) : 'Your personalized'}</div>
     <div class="palm-title">PALM READING GUIDE</div>
     <div class="palm-sub">Insights from ${personName ? esc(personName) + "'s" : 'your'} ${esc(handLabel)} — novelty reading${meta.model ? ' · ' + esc(meta.model) : ''}</div>
   </div>
 
-  <div class="palm-hero">
+  <div class="palm-section palm-hero">
     ${dataUrl ? `<div class="palm-photo"><img src="${dataUrl}" alt="Your palm"></div>` : ''}
     <div class="palm-overview">
       <h3>Palm Overview</h3>
@@ -5364,30 +5366,32 @@
     </div>
   </div>
 
-  <div class="palm-pills">
+  <div class="palm-section palm-pills">
     ${pill('Hand',    r.hand)}
     ${pill('Shape',   r.shape)}
     ${pill('Fingers', r.fingers)}
     ${pill('Thumb',   r.thumb)}
   </div>
 
-  <h3>Palm Lines</h3>
-  <ol class="palm-lines">
-    <li><strong>❤️ Heart Line</strong> — ${esc(lines.heart || '')}</li>
-    <li><strong>🧠 Head Line</strong> — ${esc(lines.head || '')}</li>
-    <li><strong>🌱 Life Line</strong> — ${esc(lines.life || '')}</li>
-    <li><strong>⭐ Fate Line</strong> — ${esc(lines.fate || '')}</li>
-    <li><strong>☀️ Sun Line</strong> — ${esc(lines.sun || '')}</li>
-  </ol>
+  <div class="palm-section palm-lines-wrap">
+    <h3>Palm Lines</h3>
+    <ol class="palm-lines">
+      <li><strong>❤️ Heart Line</strong> — ${esc(lines.heart || '')}</li>
+      <li><strong>🧠 Head Line</strong> — ${esc(lines.head || '')}</li>
+      <li><strong>🌱 Life Line</strong> — ${esc(lines.life || '')}</li>
+      <li><strong>⭐ Fate Line</strong> — ${esc(lines.fate || '')}</li>
+      <li><strong>☀️ Sun Line</strong> — ${esc(lines.sun || '')}</li>
+    </ol>
+  </div>
 
-  <div class="palm-grid4">
+  <div class="palm-section palm-grid4">
     <div class="palm-block"><strong>💼 Career &amp; Purpose</strong>${esc(r.career_purpose || '')}</div>
     <div class="palm-block"><strong>💰 Money &amp; Finances</strong>${esc(r.money_finances || '')}</div>
     <div class="palm-block"><strong>🫀 Health &amp; Vitality</strong>${esc(r.health_vitality || '')}</div>
     <div class="palm-block"><strong>💞 Relationships &amp; Love</strong>${esc(r.relationships_love || '')}</div>
   </div>
 
-  <div class="palm-grid4">
+  <div class="palm-section palm-grid4">
     <div class="palm-block"><strong>✨ Strengths</strong>${bullets(r.strengths)}</div>
     <div class="palm-block"><strong>⚠️ Challenges</strong>${bullets(r.challenges)}</div>
     <div class="palm-block"><strong>🍀 Luck &amp; Opportunities</strong>${esc(r.luck_opportunities || '')}</div>
@@ -5395,12 +5399,12 @@
   </div>
 
   ${r.final_reading ? `
-    <div class="palm-final">
+    <div class="palm-section palm-final">
       <strong>✦ Final Reading</strong>
       ${esc(r.final_reading)}
     </div>` : ''}
 
-  <div class="palm-disclaimer">${esc(disclaimer)}</div>
+  <div class="palm-section palm-disclaimer">${esc(disclaimer)}</div>
 
   <div class="palm-actions">
     <button class="palm-action-btn" onclick="palmDownloadImage(this)" type="button">📥 Save as Image</button>
@@ -5471,6 +5475,11 @@
         }
       }
 
+      // Section-aware PDF builder: renders each .palm-section to its own
+      // canvas, then packs them into pages without ever splitting a section
+      // across a page boundary. If a single section is taller than a page on
+      // its own (rare — usually the trait pills grid wraps weird), it falls
+      // back to slicing just that one section.
       async function palmDownloadPdf(btn) {
         const card = btn && btn.closest('.palm-card');
         if (!card) return;
@@ -5478,43 +5487,120 @@
           toast('PDF library still loading — try again in a moment.');
           return;
         }
+        if (!window.html2canvas) {
+          toast('html2canvas still loading — try again in a moment.');
+          return;
+        }
         const origLabel = btn.textContent;
         btn.disabled = true;
         btn.textContent = '⏳ Building PDF…';
+
+        // Hide the action buttons while we capture sections.
+        const actions = card.querySelector('.palm-actions');
+        const prevActionsDisplay = actions ? actions.style.display : '';
+        if (actions) actions.style.display = 'none';
+
         try {
-          const canvas = await _palmCardToCanvas(card);
+          const sections = Array.from(card.querySelectorAll('.palm-section'));
+          if (!sections.length) {
+            throw new Error('No .palm-section blocks found in the card.');
+          }
+          const cardBg = getComputedStyle(card).backgroundColor || '#0e1014';
+          const renderOpts = {
+            backgroundColor: cardBg,
+            scale: window.devicePixelRatio > 1 ? 2 : 1.5,
+            logging: false,
+            useCORS: true,
+            allowTaint: false,
+          };
+
+          // Render every section to its own canvas, in DOM order.
+          const sectionCanvases = [];
+          for (const sec of sections) {
+            sectionCanvases.push(await html2canvas(sec, renderOpts));
+          }
+
           const { jsPDF } = window.jspdf;
           const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'letter' });
           const pageW = pdf.internal.pageSize.getWidth();
           const pageH = pdf.internal.pageSize.getHeight();
-          const margin = 36;
+          const margin = 40;
           const usableW = pageW - 2 * margin;
           const usableH = pageH - 2 * margin;
+          const gap = 10;   // pt of vertical space between sections on the same page
 
-          // How many source-canvas pixels fit per page when scaled to usableW?
-          const pxPerPage = Math.floor(canvas.width * (usableH / usableW));
-          const totalPages = Math.max(1, Math.ceil(canvas.height / pxPerPage));
+          let pageIndex = 0;
+          let cursorY = margin;
+          // Paint the page background so margins don't sit on glaring white
+          // (the on-screen card uses a dark bg; the PDF should match).
+          const paintPageBg = () => {
+            pdf.setFillColor(cardBg.startsWith('rgb') ? cardBg : '#0e1014');
+            pdf.rect(0, 0, pageW, pageH, 'F');
+          };
+          paintPageBg();
 
-          for (let p = 0; p < totalPages; p++) {
-            const sliceH = Math.min(pxPerPage, canvas.height - p * pxPerPage);
-            const slice = document.createElement('canvas');
-            slice.width = canvas.width;
-            slice.height = sliceH;
-            const ctx = slice.getContext('2d');
-            ctx.fillStyle = '#0e1014';
-            ctx.fillRect(0, 0, slice.width, slice.height);
-            ctx.drawImage(canvas, 0, -p * pxPerPage);
-            const dataUrl = slice.toDataURL('image/jpeg', 0.92);
-            if (p > 0) pdf.addPage();
-            const drawHeight = (sliceH / canvas.width) * usableW;
-            pdf.addImage(dataUrl, 'JPEG', margin, margin, usableW, drawHeight);
-          }
+          // Add one section to the running page; if it doesn't fit, advance
+          // to a fresh page first.
+          const placeSection = (canvas) => {
+            const drawH = (canvas.height / canvas.width) * usableW;
+            // Section fits in the page entirely → place it (possibly after
+            // advancing the page if it's too tall to fit in remaining space).
+            if (drawH <= usableH) {
+              if (cursorY + drawH > pageH - margin && cursorY > margin) {
+                pdf.addPage();
+                pageIndex++;
+                paintPageBg();
+                cursorY = margin;
+              }
+              pdf.addImage(canvas.toDataURL('image/jpeg', 0.92),
+                           'JPEG', margin, cursorY, usableW, drawH);
+              cursorY += drawH + gap;
+              return;
+            }
+
+            // Section taller than a single page on its own — start a fresh
+            // page and slice this section across as many pages as needed.
+            if (cursorY > margin) {
+              pdf.addPage();
+              pageIndex++;
+              paintPageBg();
+              cursorY = margin;
+            }
+            const pxPerPage = Math.floor(canvas.width * (usableH / usableW));
+            let yPx = 0;
+            while (yPx < canvas.height) {
+              const sliceH = Math.min(pxPerPage, canvas.height - yPx);
+              const slice = document.createElement('canvas');
+              slice.width = canvas.width;
+              slice.height = sliceH;
+              const ctx = slice.getContext('2d');
+              ctx.fillStyle = cardBg;
+              ctx.fillRect(0, 0, slice.width, slice.height);
+              ctx.drawImage(canvas, 0, -yPx);
+              const sliceDraw = (sliceH / canvas.width) * usableW;
+              pdf.addImage(slice.toDataURL('image/jpeg', 0.92),
+                           'JPEG', margin, margin, usableW, sliceDraw);
+              yPx += sliceH;
+              if (yPx < canvas.height) {
+                pdf.addPage();
+                pageIndex++;
+                paintPageBg();
+              } else {
+                cursorY = margin + sliceDraw + gap;
+              }
+            }
+          };
+
+          for (const c of sectionCanvases) placeSection(c);
+
+          const totalPages = pageIndex + 1;
           pdf.save(`palm-reading-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.pdf`);
           toast(`Saved palm reading as PDF (${totalPages} page${totalPages === 1 ? '' : 's'})`);
         } catch (e) {
           console.error(e);
           toast('PDF save failed: ' + (e.message || e));
         } finally {
+          if (actions) actions.style.display = prevActionsDisplay;
           btn.disabled = false;
           btn.textContent = origLabel;
         }

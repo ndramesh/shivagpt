@@ -834,6 +834,33 @@ async def palm_read(req: Request) -> dict[str, Any]:
         except json.JSONDecodeError as e:
             raise HTTPException(502, f"Model JSON unparseable: {e}")
 
+    # Strip markdown code formatting from every string in the reading.
+    # qwen3-vl-thinking and similar models love peppering their output with
+    # backticks and ```fenced blocks``` — fine for chat, ugly in a palm card
+    # where they render as monospace blocks.
+    def _scrub(s: str) -> str:
+        if not isinstance(s, str):
+            return s
+        # Drop fenced code blocks entirely (they have no place here).
+        s = re.sub(r"```[\s\S]*?```", "", s)
+        # Unwrap inline `code` to plain text.
+        s = re.sub(r"`([^`]+)`", r"\1", s)
+        # Collapse runs of whitespace introduced by the removals.
+        s = re.sub(r"[ \t]+", " ", s)
+        s = re.sub(r"\n{3,}", "\n\n", s)
+        return s.strip()
+
+    def _scrub_tree(obj):
+        if isinstance(obj, str):
+            return _scrub(obj)
+        if isinstance(obj, list):
+            return [_scrub_tree(x) for x in obj]
+        if isinstance(obj, dict):
+            return {k: _scrub_tree(v) for k, v in obj.items()}
+        return obj
+
+    reading = _scrub_tree(reading)
+
     # Force the hand label to match what the caller specified — the model
     # sometimes flips L/R or invents a creative description, but the user
     # told us which hand they photographed.
