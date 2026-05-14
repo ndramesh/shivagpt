@@ -760,25 +760,32 @@ async def palm_read(req: Request) -> dict[str, Any]:
         "}"
     )
 
-    upstream = json.dumps({
+    # `format=json` constrains output to a JSON object. That's great for
+    # vanilla vision models, but it deadlocks with reasoning models
+    # (qwen3-vl:*-thinking, deepseek-r1) — they want to think in plain
+    # text first, and format=json blocks that, so the model either hangs
+    # or never produces output. For thinking models we drop format=json
+    # and rely on the parser's <think>-strip + JSON-extract fallback.
+    is_thinking = "thinking" in model.lower() or model.lower().endswith("-think")
+    upstream_payload = {
         "model": model,
         "messages": [
             {"role": "system", "content": system},
             {"role": "user", "content": user_prompt, "images": [image_b64]},
         ],
         "stream": False,
-        # Constrain Ollama to emit a JSON object — supported across modern
-        # Ollama versions; lets us skip a regex fallback in the happy path.
-        "format": "json",
-        # Reasoning models (qwen3-vl:*-thinking, deepseek-r1) emit a long
-        # <think>...</think> block before their answer; the JSON body of
-        # the reading itself is ~600 tokens. Budget enough headroom for
-        # both, capped so a runaway think pass doesn't burn forever.
+        # Reasoning models emit a long <think>...</think> block before
+        # their answer; the JSON body of the reading itself is ~600 tokens.
+        # Budget enough headroom for both, capped so a runaway think pass
+        # doesn't burn forever.
         "options": {"temperature": 0.7, "num_predict": 4000},
-    }).encode("utf-8")
+    }
+    if not is_thinking:
+        upstream_payload["format"] = "json"
+    upstream = json.dumps(upstream_payload).encode("utf-8")
 
-    log.info("palm: model=%s focus=%r image=%d KB",
-             model, focus[:60], len(image_b64) // 1024)
+    log.info("palm: model=%s thinking=%s focus=%r name=%r hand=%s image=%d KB",
+             model, is_thinking, focus[:60], name[:40], hand, len(image_b64) // 1024)
 
     timeout = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
     try:

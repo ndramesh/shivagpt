@@ -18,6 +18,8 @@
   <script defer src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js"></script>
   <script defer src="https://cdn.jsdelivr.net/gh/highlightjs/cdn-release@11.9.0/build/highlight.min.js"></script>
   <script defer src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+  <script defer src="https://cdn.jsdelivr.net/npm/jspdf@2.5.2/dist/jspdf.umd.min.js"></script>
 
   <style>
     /* ---------- Tokens ---------- */
@@ -745,6 +747,29 @@
       color: var(--text-3);
       font-style: italic;
       text-align: center;
+    }
+    .palm-card .palm-actions {
+      display: flex;
+      justify-content: center;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .palm-card .palm-action-btn {
+      background: var(--bg-elev-2);
+      color: var(--text-1);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 6px 14px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: background var(--transition);
+    }
+    .palm-card .palm-action-btn:hover {
+      background: var(--bg-hover);
+    }
+    .palm-card .palm-action-btn:disabled {
+      opacity: 0.6;
+      cursor: wait;
     }
     .palm-card ul.bullets {
       margin: 4px 0 8px;
@@ -5376,9 +5401,128 @@
     </div>` : ''}
 
   <div class="palm-disclaimer">${esc(disclaimer)}</div>
+
+  <div class="palm-actions">
+    <button class="palm-action-btn" onclick="palmDownloadImage(this)" type="button">📥 Save as Image</button>
+    <button class="palm-action-btn" onclick="palmDownloadPdf(this)" type="button">📄 Save as PDF</button>
+  </div>
 </div>
 `.trim();
       }
+
+      // Convert the rendered palm card to a high-DPI canvas. Used by both the
+      // PNG and PDF download paths. Action buttons are temporarily hidden so
+      // they don't appear in the saved output.
+      async function _palmCardToCanvas(card) {
+        if (!window.html2canvas) {
+          throw new Error('html2canvas not loaded yet — give the CDN a moment and retry.');
+        }
+        const actions = card.querySelector('.palm-actions');
+        const prevDisplay = actions ? actions.style.display : '';
+        if (actions) actions.style.display = 'none';
+        try {
+          // Read the actual computed bg color so the screenshot doesn't end
+          // up with a transparent / mismatched background.
+          const bg = getComputedStyle(card).backgroundColor || '#0e1014';
+          return await html2canvas(card, {
+            backgroundColor: bg,
+            scale: window.devicePixelRatio > 1 ? 2 : 1.5,
+            logging: false,
+            useCORS: true,
+            // html2canvas can fail when the image element doesn't have
+            // crossOrigin set; we use data: URLs for the palm photo so
+            // this is fine, but flag it anyway.
+            allowTaint: false,
+          });
+        } finally {
+          if (actions) actions.style.display = prevDisplay;
+        }
+      }
+
+      async function palmDownloadImage(btn) {
+        const card = btn && btn.closest('.palm-card');
+        if (!card) return;
+        const origLabel = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '⏳ Rendering…';
+        try {
+          const canvas = await _palmCardToCanvas(card);
+          await new Promise((resolve, reject) => {
+            canvas.toBlob((blob) => {
+              if (!blob) { reject(new Error('toBlob returned null')); return; }
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = `palm-reading-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.png`;
+              document.body.appendChild(a);
+              a.click();
+              document.body.removeChild(a);
+              setTimeout(() => URL.revokeObjectURL(url), 1000);
+              resolve();
+            }, 'image/png');
+          });
+          toast('Saved palm reading as PNG');
+        } catch (e) {
+          console.error(e);
+          toast('Image save failed: ' + (e.message || e));
+        } finally {
+          btn.disabled = false;
+          btn.textContent = origLabel;
+        }
+      }
+
+      async function palmDownloadPdf(btn) {
+        const card = btn && btn.closest('.palm-card');
+        if (!card) return;
+        if (!window.jspdf || !window.jspdf.jsPDF) {
+          toast('PDF library still loading — try again in a moment.');
+          return;
+        }
+        const origLabel = btn.textContent;
+        btn.disabled = true;
+        btn.textContent = '⏳ Building PDF…';
+        try {
+          const canvas = await _palmCardToCanvas(card);
+          const { jsPDF } = window.jspdf;
+          const pdf = new jsPDF({ orientation: 'portrait', unit: 'pt', format: 'letter' });
+          const pageW = pdf.internal.pageSize.getWidth();
+          const pageH = pdf.internal.pageSize.getHeight();
+          const margin = 36;
+          const usableW = pageW - 2 * margin;
+          const usableH = pageH - 2 * margin;
+
+          // How many source-canvas pixels fit per page when scaled to usableW?
+          const pxPerPage = Math.floor(canvas.width * (usableH / usableW));
+          const totalPages = Math.max(1, Math.ceil(canvas.height / pxPerPage));
+
+          for (let p = 0; p < totalPages; p++) {
+            const sliceH = Math.min(pxPerPage, canvas.height - p * pxPerPage);
+            const slice = document.createElement('canvas');
+            slice.width = canvas.width;
+            slice.height = sliceH;
+            const ctx = slice.getContext('2d');
+            ctx.fillStyle = '#0e1014';
+            ctx.fillRect(0, 0, slice.width, slice.height);
+            ctx.drawImage(canvas, 0, -p * pxPerPage);
+            const dataUrl = slice.toDataURL('image/jpeg', 0.92);
+            if (p > 0) pdf.addPage();
+            const drawHeight = (sliceH / canvas.width) * usableW;
+            pdf.addImage(dataUrl, 'JPEG', margin, margin, usableW, drawHeight);
+          }
+          pdf.save(`palm-reading-${new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-')}.pdf`);
+          toast(`Saved palm reading as PDF (${totalPages} page${totalPages === 1 ? '' : 's'})`);
+        } catch (e) {
+          console.error(e);
+          toast('PDF save failed: ' + (e.message || e));
+        } finally {
+          btn.disabled = false;
+          btn.textContent = origLabel;
+        }
+      }
+      // Expose globally so the inline onclick handlers on the rendered card
+      // (which lives inside an .innerHTML-rendered subtree) can resolve them.
+      window.palmDownloadImage = palmDownloadImage;
+      window.palmDownloadPdf = palmDownloadPdf;
 
       // Render the watchlist as a compact dashboard with one row per ticker
       // and a small chart embedded per row. The `results` array is the raw
