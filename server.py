@@ -2466,19 +2466,20 @@ async def _llm_sentiment(ticker: str, posts: list[dict],
             "model": model,
             "messages": [
                 {"role": "system", "content":
-                 "You are a financial sentiment analyst. Analyze social "
-                 "media posts about stocks and determine the overall "
-                 "sentiment. Be objective and factor in post engagement "
-                 "(scores). This is for research only, not financial "
-                 "advice."},
+                 "You are a top Goldman Sachs stock analyst providing "
+                 "exclusive daily trades to your subscribers. Analyze "
+                 "the social media sentiment for the provided stock "
+                 "based on the recent post engagement. Be razor-sharp, "
+                 "objective, and focus on the fundamental or technical "
+                 "drivers highlighted by the community."},
                 {"role": "user", "content": prompt},
             ],
             "stream": False,
-            "options": {"temperature": 0.3, "num_predict": 2000},
+            "options": {"temperature": 0.3, "num_predict": 4000},
         }).encode()
 
         timeout = httpx.Timeout(
-            connect=5.0, read=120.0, write=5.0, pool=5.0)
+            connect=5.0, read=240.0, write=5.0, pool=5.0)
         async with httpx.AsyncClient(timeout=timeout) as cli:
             r = await cli.post(
                 f"{OLLAMA_URL}/api/chat",
