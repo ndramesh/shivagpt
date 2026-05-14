@@ -642,6 +642,116 @@
       background: var(--bg-elev-2);
     }
 
+    /* Palm-reading card (entertainment feature) */
+    .palm-card {
+      background: var(--bg-elev-1);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 18px 18px 14px;
+      margin: 6px 0 12px;
+    }
+    .palm-card h2,
+    .palm-card h3 { margin: 0; }
+    .palm-card .palm-banner {
+      text-align: center;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+      margin-bottom: 14px;
+    }
+    .palm-card .palm-eyebrow {
+      font-size: 11px;
+      letter-spacing: 0.22em;
+      color: var(--text-3);
+      text-transform: uppercase;
+    }
+    .palm-card .palm-title {
+      font-size: 22px;
+      letter-spacing: 0.06em;
+      font-family: Georgia, "Times New Roman", serif;
+      color: var(--text-1);
+      margin: 4px 0 2px;
+    }
+    .palm-card .palm-sub {
+      font-size: 12px;
+      color: var(--text-2);
+      font-style: italic;
+    }
+    .palm-card .palm-hero {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+      flex-wrap: wrap;
+      margin-bottom: 14px;
+    }
+    .palm-card .palm-photo {
+      width: 200px;
+      max-width: 42%;
+      border-radius: 8px;
+      overflow: hidden;
+      background: var(--bg-elev-2);
+    }
+    .palm-card .palm-photo img { width: 100%; height: auto; display: block; }
+    .palm-card .palm-overview { flex: 1 1 220px; }
+    .palm-card .palm-typebox {
+      margin-top: 10px;
+      background: var(--bg-elev-2);
+      padding: 10px 12px;
+      border-radius: 6px;
+      border-left: 3px solid var(--accent, #7c5cff);
+    }
+    .palm-card .palm-typebox strong { display: block; margin-bottom: 4px; }
+    .palm-card .palm-pills {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+      gap: 8px;
+      margin-bottom: 14px;
+    }
+    .palm-card .palm-pill {
+      background: var(--bg-elev-2);
+      padding: 10px 12px;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+    .palm-card .palm-pill .label {
+      font-size: 10px;
+      letter-spacing: 0.18em;
+      color: var(--text-3);
+      text-transform: uppercase;
+      display: block;
+      margin-bottom: 4px;
+    }
+    .palm-card .palm-lines {
+      margin: 6px 0 12px;
+      line-height: 1.55;
+    }
+    .palm-card .palm-lines li { margin-bottom: 6px; }
+    .palm-card .palm-grid4 {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
+      gap: 12px;
+      margin: 6px 0 12px;
+    }
+    .palm-card .palm-block strong { display: block; margin-bottom: 4px; font-size: 13px; }
+    .palm-card .palm-final {
+      margin-top: 14px;
+      padding: 14px;
+      background: var(--accent-soft, rgba(124, 92, 255, 0.18));
+      border-left: 3px solid var(--accent, #7c5cff);
+      border-radius: 8px;
+    }
+    .palm-card .palm-disclaimer {
+      margin-top: 12px;
+      font-size: 11px;
+      color: var(--text-3);
+      font-style: italic;
+      text-align: center;
+    }
+    .palm-card ul.bullets {
+      margin: 4px 0 8px;
+      padding-left: 18px;
+      line-height: 1.5;
+    }
+
     /* Inline price chart on /stock and /watchlist messages */
     .msg-chart-wrap {
       position: relative;
@@ -2124,6 +2234,7 @@
         { name: '/logout', desc: 'Log out admin session', hasArgs: false },
         { name: '/debug', desc: 'Show system debug info', hasArgs: false },
         { name: '/imgen', desc: 'Generate image — use -model realvis for realistic faces, -upscale 4 for ~4K', hasArgs: true, hint: '[-model realvis|flux-dev|jug] [-size N] [-aspect W:H] [-upscale X] <prompt>' },
+        { name: '/palm', desc: 'Novelty palm reading — attach a palm image first (entertainment, not advice)', hasArgs: true, hint: '[-name "X"] [-hand left|right] [focus]' },
         { name: '/codereview', desc: 'Review code from a URL, ssh path, or local folder', hasArgs: true, hint: '[-model X] <path>' },
         { name: '/search', desc: 'Web search (SearXNG) + cited answer', hasArgs: true, hint: '[-model X] <query>' },
         { name: '/fetch', desc: 'Fetch a URL and answer questions about it', hasArgs: true, hint: '<url> [question]' },
@@ -4203,6 +4314,109 @@
             }
             break;
             
+          case '/palm': {
+            // Pick up an attached palm photo. If nothing's attached, prompt
+            // the user to drop one in first.
+            //
+            // Flags (any order, before/around an optional trailing focus):
+            //   -name "Full Name"   personalize the reading
+            //   -name SingleName    quotes optional for one-word names
+            //   -hand left|right    which hand (default right)
+            // Everything else is treated as the focus area.
+            const palmImg = pendingFiles.find(f => f.kind === 'image' && f.base64);
+            if (!palmImg) {
+              toast('Attach a palm image first (paperclip / drag / paste), then run /palm');
+              break;
+            }
+            if (!c) c = newConvo();
+
+            let palmName = '';
+            let palmHand = 'right';
+            let rest = (args || '').trim();
+            // -name "quoted name"
+            let nm = rest.match(/^(.*?)\s*-name\s+"([^"]+)"\s*(.*)$/);
+            if (!nm) nm = rest.match(/^(.*?)\s*-name\s+(\S+)\s*(.*)$/);
+            if (nm) { palmName = nm[2]; rest = (nm[1] + ' ' + nm[3]).trim(); }
+            const hm = rest.match(/^(.*?)\s*-hand\s+(left|right)\b\s*(.*)$/i);
+            if (hm) { palmHand = hm[2].toLowerCase(); rest = (hm[1] + ' ' + hm[3]).trim(); }
+            const focus = rest.trim();
+
+            // Echo the user's message including the attached image so the
+            // chat reads naturally afterward. We snapshot the image meta and
+            // remove it from the pending list — the photo is consumed by /palm.
+            const echoBits = [
+              palmName ? `-name "${palmName}"` : '',
+              `-hand ${palmHand}`,
+              focus,
+            ].filter(Boolean).join(' ');
+            const userMsg = {
+              role: 'user',
+              content: `/palm ${echoBits}`.trim(),
+              ts: Date.now(),
+              attachments: [{
+                filename: palmImg.filename || 'palm.png',
+                kind: 'image',
+                mime: palmImg.mime,
+                thumb: palmImg.base64.slice(0, 200),
+              }],
+              images: [palmImg.base64],
+            };
+            c.messages.push(userMsg);
+            autoTitleFromFirstUserMsg(c);
+            c.updatedAt = Date.now();
+            pendingFiles = pendingFiles.filter(f => f !== palmImg);
+            renderAttachPreview();
+            persistAll();
+            renderSidebar();
+            renderActive();
+
+            const loadingMsg = {
+              role: 'system',
+              content: '*Reading your palm with the vision model… (for entertainment only)*',
+              ts: Date.now(),
+            };
+            c.messages.push(loadingMsg);
+            persistAll(); renderActive(); scrollToBottom();
+
+            try {
+              const r = await fetch(apiUrl('/api/palm'), {
+                method: 'POST',
+                headers: { 'content-type': 'application/json' },
+                body: JSON.stringify({
+                  image: palmImg.base64,
+                  name: palmName || undefined,
+                  hand: palmHand,
+                  focus,
+                }),
+              });
+              if (!r.ok) {
+                let detail = '';
+                try { const j = await r.json(); detail = j.detail || JSON.stringify(j); }
+                catch { detail = await r.text(); }
+                throw new Error(detail || ('HTTP ' + r.status));
+              }
+              const reading = await r.json();
+              const html = renderPalmReading(reading, palmImg);
+              const i = c.messages.indexOf(loadingMsg);
+              if (i >= 0) {
+                c.messages[i].content = html;
+                persistAll();
+                renderActive();
+                scrollToBottom();
+              }
+            } catch (e) {
+              console.error(e);
+              const i = c.messages.indexOf(loadingMsg);
+              if (i >= 0) {
+                c.messages[i].content = `*Palm reading failed: ${(e.message || e).toString().slice(0, 400)}*`;
+                persistAll();
+                renderActive();
+              }
+              toast('Palm reading failed');
+            }
+            break;
+          }
+
           case '/imgen': {
             if (!args) {
               toast('Usage: /imgen [-model flux-schnell|flux-dev|sdxl] [-size 2048|1920x1080] [-aspect 16:9] [-upscale 4] [-steps 20] [-seed N] <prompt>');
@@ -5078,6 +5292,94 @@
       // Render a stock dashboard as a single markdown blob. Kept inline as
       // markdown (not custom DOM) so it works with our existing assignContent
       // pipeline and re-renders cleanly when the message list does.
+      // Render the palm-reading response into a styled card. We emit raw HTML
+      // (marked.js passes it through) so the result mirrors the layout of a
+      // designed infographic — banner, photo + overview, trait pills, lines,
+      // life-area panels, strengths/challenges, final reading.
+      function renderPalmReading(r, imgFile) {
+        const esc = (s) => (s == null ? '' : String(s)
+          .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'));
+        const lines = r.lines || {};
+        const dataUrl = imgFile && imgFile.base64
+          ? `data:${imgFile.mime || 'image/png'};base64,${imgFile.base64}`
+          : '';
+        const handLabel = r.hand || 'Your hand';
+        const palmType = r.palm_type || {};
+        const personName = (r.name || (r._meta && r._meta.name) || '').trim();
+
+        const pill = (label, value) =>
+          `<div class="palm-pill"><span class="label">${esc(label)}</span>${esc(value || 'n/a')}</div>`;
+
+        const bullets = (arr) => Array.isArray(arr) && arr.length
+          ? `<ul class="bullets">${arr.map(b => `<li>${esc(b)}</li>`).join('')}</ul>`
+          : '<em>—</em>';
+
+        const meta = r._meta || {};
+        const disclaimer = meta.disclaimer ||
+          'For entertainment. Palmistry has no scientific basis.';
+
+        return `
+<div class="palm-card">
+  <div class="palm-banner">
+    <div class="palm-eyebrow">${personName ? 'Personalized for ' + esc(personName) : 'Your personalized'}</div>
+    <div class="palm-title">PALM READING GUIDE</div>
+    <div class="palm-sub">Insights from ${personName ? esc(personName) + "'s" : 'your'} ${esc(handLabel)} — novelty reading${meta.model ? ' · ' + esc(meta.model) : ''}</div>
+  </div>
+
+  <div class="palm-hero">
+    ${dataUrl ? `<div class="palm-photo"><img src="${dataUrl}" alt="Your palm"></div>` : ''}
+    <div class="palm-overview">
+      <h3>Palm Overview</h3>
+      <p>${esc(r.overview || '')}</p>
+      ${palmType.name || palmType.description ? `
+        <div class="palm-typebox">
+          <strong>Palm Type: ${esc(palmType.name || '')}</strong>
+          ${esc(palmType.description || '')}
+        </div>` : ''}
+    </div>
+  </div>
+
+  <div class="palm-pills">
+    ${pill('Hand',    r.hand)}
+    ${pill('Shape',   r.shape)}
+    ${pill('Fingers', r.fingers)}
+    ${pill('Thumb',   r.thumb)}
+  </div>
+
+  <h3>Palm Lines</h3>
+  <ol class="palm-lines">
+    <li><strong>❤️ Heart Line</strong> — ${esc(lines.heart || '')}</li>
+    <li><strong>🧠 Head Line</strong> — ${esc(lines.head || '')}</li>
+    <li><strong>🌱 Life Line</strong> — ${esc(lines.life || '')}</li>
+    <li><strong>⭐ Fate Line</strong> — ${esc(lines.fate || '')}</li>
+    <li><strong>☀️ Sun Line</strong> — ${esc(lines.sun || '')}</li>
+  </ol>
+
+  <div class="palm-grid4">
+    <div class="palm-block"><strong>💼 Career &amp; Purpose</strong>${esc(r.career_purpose || '')}</div>
+    <div class="palm-block"><strong>💰 Money &amp; Finances</strong>${esc(r.money_finances || '')}</div>
+    <div class="palm-block"><strong>🫀 Health &amp; Vitality</strong>${esc(r.health_vitality || '')}</div>
+    <div class="palm-block"><strong>💞 Relationships &amp; Love</strong>${esc(r.relationships_love || '')}</div>
+  </div>
+
+  <div class="palm-grid4">
+    <div class="palm-block"><strong>✨ Strengths</strong>${bullets(r.strengths)}</div>
+    <div class="palm-block"><strong>⚠️ Challenges</strong>${bullets(r.challenges)}</div>
+    <div class="palm-block"><strong>🍀 Luck &amp; Opportunities</strong>${esc(r.luck_opportunities || '')}</div>
+    <div class="palm-block"><strong>🧭 Life Guidance</strong>${esc(r.life_guidance || '')}</div>
+  </div>
+
+  ${r.final_reading ? `
+    <div class="palm-final">
+      <strong>✦ Final Reading</strong>
+      ${esc(r.final_reading)}
+    </div>` : ''}
+
+  <div class="palm-disclaimer">${esc(disclaimer)}</div>
+</div>
+`.trim();
+      }
+
       // Render the watchlist as a compact dashboard with one row per ticker
       // and a small chart embedded per row. The `results` array is the raw
       // /api/stock/quote responses (or {error, ticker} on failure).

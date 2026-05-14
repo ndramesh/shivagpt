@@ -5,6 +5,27 @@ All notable changes to ShivaGPT are documented in this file.
 ## [Unreleased]
 
 ### Added
+- **`/palm` now takes `-name "Full Name"` and `-hand left|right`.**
+  Server-side, the hand goes into the prompt with the right palmistry
+  convention attached ("active hand — current path" for right vs
+  "passive hand — inherited traits" for left), so the model
+  interprets the lines correctly instead of guessing. The card banner
+  shows "Personalized for <name>" and "Insights from <name>'s
+  <hand> palm." The hand field on the returned JSON is forced to match
+  the caller (so the model can't flip L/R on us).
+- **`/palm` — novelty palm reading.** Attach a palm image, run `/palm`
+  (optional focus area like `/palm career`), and the vision model
+  (`qwen2.5vl` by default, override via `PALM_MODEL`) returns a
+  structured JSON reading via Ollama's `format=json` mode. The frontend
+  renders it as a styled card mimicking a designed infographic:
+  banner header → palm photo + overview + palm type → four trait pills
+  (hand/shape/fingers/thumb) → five-line section (heart/head/life/fate/
+  sun) → four life-area panels (career/money/health/relationships) →
+  strengths/challenges/luck/guidance → final reading. Includes an
+  "entertainment only" disclaimer (palmistry has no scientific basis).
+  New endpoint: `POST /api/palm`.
+
+### Added
 - **Scheduled tasks can email their output.** New SMTP delivery layer
   using stdlib `smtplib` + `markdown` for HTML rendering. Configure
   via `SMTP_HOST`, `SMTP_PORT` (default 587), `SMTP_USER`, `SMTP_PASS`,

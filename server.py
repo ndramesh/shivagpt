@@ -656,6 +656,199 @@ async def process_image(req: Request) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# Palm reading (/api/palm)
+#
+# Novelty feature. The user attaches a palm photo and we ask qwen2.5vl
+# (or whatever vision model is configured) to do a structured palmistry
+# reading. Output is JSON the frontend renders as a styled card.
+#
+# Disclaimer: palmistry has no scientific basis. The endpoint and its
+# rendered card include "for entertainment" notices throughout.
+# ---------------------------------------------------------------------------
+
+PALM_MODEL = os.getenv("PALM_MODEL", "qwen2.5vl")
+
+
+@app.post("/api/palm")
+async def palm_read(req: Request) -> dict[str, Any]:
+    """Analyze a palm image and return a structured palm-reading JSON blob.
+
+    Body: { image: <base64>, focus?: str, model?: str }
+    Returns: JSON matching the reading-card shape (overview, palm_type,
+    hand/shape/fingers/thumb, lines, career/money/health/relationships,
+    strengths, challenges, luck, guidance, final_reading).
+    """
+    try:
+        body = await req.json()
+    except Exception:
+        raise HTTPException(400, "Invalid JSON body")
+
+    image_b64 = (body.get("image") or "").strip()
+    if not image_b64:
+        raise HTTPException(400, "Missing 'image' (base64)")
+    focus = (body.get("focus") or "").strip()
+    model = (body.get("model") or PALM_MODEL).strip()
+    name = (body.get("name") or "").strip()
+    hand = (body.get("hand") or "right").strip().lower()
+    if hand not in ("left", "right"):
+        hand = "right"
+
+    # Strip a potential data: URL prefix
+    if image_b64.startswith("data:"):
+        comma = image_b64.find(",")
+        if comma >= 0:
+            image_b64 = image_b64[comma + 1:]
+
+    # The hand convention matters: right traditionally = active/current life,
+    # left = potential/inherited. We tell the model which one we're looking at
+    # so it interprets the marks correctly.
+    hand_note = (
+        f"This is the person's {hand} hand "
+        + ("(active hand — current life, present choices)."
+           if hand == "right"
+           else "(passive hand — inherited traits, potential).")
+    )
+    name_clause = (
+        f"\n\nThe person's name is {name}. Address them by name "
+        "(\"{name}\") two or three times across the reading, naturally."
+        if name else ""
+    ).replace("{name}", name)
+
+    system = (
+        "You are a friendly, theatrical palm reader giving a novelty palm "
+        "reading. Look at the palm image and apply traditional Western "
+        "palmistry conventions (heart line, head line, life line, fate line, "
+        "sun line; hand shapes Earth/Air/Fire/Water; finger lengths; thumb "
+        "rigidity). Be specific to what you can see, but stay positive, "
+        "constructive, and never claim medical, financial, or legal "
+        "predictions. This is entertainment, not advice."
+    )
+    focus_clause = (
+        f"\n\nThe person specifically asked you to focus on: {focus}.\n"
+        "Weight your reading toward that area, but still produce all sections."
+        if focus else ""
+    )
+    user_prompt = (
+        f"{hand_note}{name_clause}\n\n"
+        "Please give me a palm reading for the hand in this image."
+        + focus_clause +
+        "\n\nReturn ONLY valid JSON in exactly this shape (no extra prose, "
+        "no markdown fences). Keep each string short (1-3 sentences):\n"
+        "{\n"
+        '  "overview":          "2-3 sentences on overall traits",\n'
+        '  "palm_type":         {"name": "Earth | Air | Fire | Water | <Mix>", "description": "1 sentence"},\n'
+        '  "hand":              "Right | Left + (active/passive note)",\n'
+        '  "shape":             "Rectangular | Square | Conical | Spatulate Palm — short meaning",\n'
+        '  "fingers":           "Short | Medium | Long — short meaning",\n'
+        '  "thumb":             "describe + what it suggests",\n'
+        '  "lines": {\n'
+        '    "heart":           "loyalty/emotional depth observations",\n'
+        '    "head":            "intellect/analytical observations",\n'
+        '    "life":            "vitality/stamina observations",\n'
+        '    "fate":            "career path observations",\n'
+        '    "sun":             "creativity/recognition observations"\n'
+        '  },\n'
+        '  "career_purpose":    "1-2 sentences",\n'
+        '  "money_finances":    "1-2 sentences (no specific stock/trade advice)",\n'
+        '  "health_vitality":   "1-2 sentences, generic wellness only",\n'
+        '  "relationships_love":"1-2 sentences",\n'
+        '  "strengths":         ["3-5 short bullet points"],\n'
+        '  "challenges":        ["3-5 short bullet points"],\n'
+        '  "luck_opportunities":"1-2 sentences",\n'
+        '  "life_guidance":     "1-2 sentences",\n'
+        '  "final_reading":     "uplifting closing summary"\n'
+        "}"
+    )
+
+    upstream = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user_prompt, "images": [image_b64]},
+        ],
+        "stream": False,
+        # Constrain Ollama to emit a JSON object — supported across modern
+        # Ollama versions; lets us skip a regex fallback in the happy path.
+        "format": "json",
+        # Reasoning models (qwen3-vl:*-thinking, deepseek-r1) emit a long
+        # <think>...</think> block before their answer; the JSON body of
+        # the reading itself is ~600 tokens. Budget enough headroom for
+        # both, capped so a runaway think pass doesn't burn forever.
+        "options": {"temperature": 0.7, "num_predict": 4000},
+    }).encode("utf-8")
+
+    log.info("palm: model=%s focus=%r image=%d KB",
+             model, focus[:60], len(image_b64) // 1024)
+
+    timeout = httpx.Timeout(connect=10.0, read=300.0, write=30.0, pool=10.0)
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as cli:
+            r = await cli.post(
+                f"{OLLAMA_URL}/api/chat",
+                content=upstream,
+                headers={"content-type": "application/json"},
+            )
+    except httpx.ConnectError as e:
+        raise HTTPException(502, f"Cannot reach Ollama: {e}")
+    except httpx.ReadTimeout:
+        raise HTTPException(504, "Vision model timed out reading the palm")
+    if r.status_code != 200:
+        # Most common failure: vision model not pulled. Surface it cleanly.
+        body_text = r.text[:300]
+        if "not found" in body_text.lower():
+            raise HTTPException(
+                503,
+                f"Vision model {model!r} is not pulled on Ollama. "
+                f"Run: ssh kailash 'ollama pull {model}'",
+            )
+        raise HTTPException(502, f"Ollama returned {r.status_code}: {body_text}")
+
+    data = r.json()
+    raw = (data.get("message") or {}).get("content") or ""
+
+    # Reasoning models (qwen3-vl:*-thinking, deepseek-r1) emit
+    # <think>...</think> before the answer. Strip those blocks before any
+    # JSON parsing so we look only at the actual structured output.
+    raw_clean = re.sub(r"<think>[\s\S]*?</think>\s*", "", raw, flags=re.IGNORECASE)
+    # Some thinking models also surround their output in markdown code fences
+    # under format=json — strip a leading/trailing ```...``` if present.
+    raw_clean = re.sub(r"^```(?:json)?\s*", "", raw_clean.strip(), flags=re.IGNORECASE)
+    raw_clean = re.sub(r"\s*```\s*$", "", raw_clean)
+
+    # Try direct parse first; fall back to extracting the first {...} object.
+    try:
+        reading = json.loads(raw_clean)
+    except json.JSONDecodeError:
+        m = re.search(r"\{[\s\S]*\}", raw_clean)
+        if not m:
+            raise HTTPException(502, f"Model returned no JSON: {raw[:300]!r}")
+        try:
+            reading = json.loads(m.group(0))
+        except json.JSONDecodeError as e:
+            raise HTTPException(502, f"Model JSON unparseable: {e}")
+
+    # Force the hand label to match what the caller specified — the model
+    # sometimes flips L/R or invents a creative description, but the user
+    # told us which hand they photographed.
+    hand_pretty = ("Right (active hand — current path & choices)"
+                   if hand == "right"
+                   else "Left (passive hand — inherited traits & potential)")
+    reading["hand"] = hand_pretty
+    if name:
+        reading["name"] = name
+
+    reading["_meta"] = {
+        "model": model,
+        "hand": hand,
+        "name": name or None,
+        "disclaimer": "This palm reading is for entertainment. "
+                      "Palmistry has no scientific basis — your decisions "
+                      "shape your future, not your hand.",
+    }
+    return reading
+
+
+# ---------------------------------------------------------------------------
 # Image Generation (/api/imgen)
 #
 # Supports multiple backends so you can pick speed vs quality vs license:
