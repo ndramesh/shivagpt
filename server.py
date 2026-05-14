@@ -721,7 +721,15 @@ async def palm_read(req: Request) -> dict[str, Any]:
         "sun line; hand shapes Earth/Air/Fire/Water; finger lengths; thumb "
         "rigidity). Be specific to what you can see, but stay positive, "
         "constructive, and never claim medical, financial, or legal "
-        "predictions. This is entertainment, not advice."
+        "predictions. This is entertainment, not advice.\n\n"
+        "CRITICAL OUTPUT RULES: every JSON string value must be PLAIN PROSE "
+        "only. No HTML tags (no <div>, <strong>, <br>, etc.). No markdown "
+        "formatting (no backticks, no triple-backtick code fences, no "
+        "asterisks, no headers, no bullet markers — bullets are emitted "
+        "structurally by the schema's array fields, not as text). No escaped "
+        "entities (no &lt;, &amp;, etc.). No quoted code samples. Just "
+        "natural-language sentences as plain text. The frontend already styles "
+        "the card; your job is content, not markup."
     )
     focus_clause = (
         f"\n\nThe person specifically asked you to focus on: {focus}.\n"
@@ -834,18 +842,32 @@ async def palm_read(req: Request) -> dict[str, Any]:
         except json.JSONDecodeError as e:
             raise HTTPException(502, f"Model JSON unparseable: {e}")
 
-    # Strip markdown code formatting from every string in the reading.
-    # qwen3-vl-thinking and similar models love peppering their output with
-    # backticks and ```fenced blocks``` — fine for chat, ugly in a palm card
-    # where they render as monospace blocks.
+    # Scrub every string in the reading. The vision model emits all sorts of
+    # formatting noise we don't want surfaced in the card — code fences,
+    # backticks, AND raw/escaped HTML tags (it sometimes tries to mimic our
+    # card structure with embedded <div class="palm-typebox">…</div>). The
+    # combo of escaped HTML + marked.js + highlight.js used to render those
+    # as a syntax-highlighted code block in the middle of the card.
+    from html import unescape as _unesc
+
     def _scrub(s: str) -> str:
         if not isinstance(s, str):
             return s
-        # Drop fenced code blocks entirely (they have no place here).
+        # 1. Decode entities first so escaped HTML (&lt;div&gt;) becomes real
+        #    HTML (<div>) that the tag-stripper can then remove.
+        try:
+            s = _unesc(s)
+        except Exception:
+            pass
+        # 2. Drop fenced code blocks entirely (no place in a palm reading).
         s = re.sub(r"```[\s\S]*?```", "", s)
-        # Unwrap inline `code` to plain text.
+        # 3. Strip real HTML tags. The leading-char restriction
+        #    ([a-zA-Z/!]) avoids mangling natural prose like "3 < 5 = ..."
+        #    which doesn't start with a tag character.
+        s = re.sub(r"<[a-zA-Z/!][^>]*>", "", s)
+        # 4. Unwrap inline `code` to plain text.
         s = re.sub(r"`([^`]+)`", r"\1", s)
-        # Collapse runs of whitespace introduced by the removals.
+        # 5. Collapse runs of horizontal whitespace introduced by the removals.
         s = re.sub(r"[ \t]+", " ", s)
         s = re.sub(r"\n{3,}", "\n\n", s)
         return s.strip()
@@ -2149,7 +2171,10 @@ TRADER_DISCLAIMER = (
 )
 
 # Subreddits to scan — ordered by signal quality.
-_REDDIT_SUBS = ["wallstreetbets", "stocks", "investing", "options", "stockmarket"]
+_REDDIT_SUBS = [
+    "wallstreetbets", "smallstreetbets", "stocks", "investing",
+    "options", "stockmarket", "securityanalysis"
+]
 
 # Common words that look like tickers but aren't.
 _TICKER_BLACKLIST = {
@@ -2450,11 +2475,11 @@ async def _llm_sentiment(ticker: str, posts: list[dict],
             ],
             "stream": False,
             "format": "json",
-            "options": {"temperature": 0.3, "num_predict": 300},
+            "options": {"temperature": 0.3, "num_predict": 2000},
         }).encode()
 
         timeout = httpx.Timeout(
-            connect=5.0, read=30.0, write=5.0, pool=5.0)
+            connect=5.0, read=120.0, write=5.0, pool=5.0)
         async with httpx.AsyncClient(timeout=timeout) as cli:
             r = await cli.post(
                 f"{OLLAMA_URL}/api/chat",
@@ -2467,8 +2492,8 @@ async def _llm_sentiment(ticker: str, posts: list[dict],
                     "thesis": "LLM unavailable", "rating": 50}
 
         raw = (r.json().get("message") or {}).get("content", "")
-        # Strip thinking blocks if present
-        raw = re.sub(r"<think>[\s\S]*?</think>\s*", "", raw,
+        # Strip thinking blocks if present (even if unclosed due to truncation)
+        raw = re.sub(r"<think>[\s\S]*?(?:</think>\s*|$)", "", raw,
                      flags=re.IGNORECASE)
         raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(),
                      flags=re.IGNORECASE)
