@@ -4294,7 +4294,8 @@ async def _run_schedule_now(sched_row: tuple) -> int:
     email_sent = 0
     if ok and email_to:
         try:
-            subject = f"[ShivaGPT] {name} · {time.strftime('%a %b %d')}"
+            display_name = name.replace("_", " ").replace("-", " ").title()
+            subject = f"[ShivaGPT] {display_name} · {time.strftime('%a %b %d')}"
             await asyncio.to_thread(_send_email, email_to, subject, output)
             email_sent = 1
         except HTTPException as e:
