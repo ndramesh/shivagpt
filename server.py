@@ -4500,11 +4500,13 @@ async def schedules_runs(sched_id: int, req: Request) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Code Review (/api/codereview)
 #
-# Stream a code review from Ollama for a path that can be:
+# Stream a code review from Ollama for:
+#   - inline `files` in the JSON body (pasted snippets from /codereview)
 #   - a GitHub URL (file/blob, repo root, or tree/branch[/subdir])
 #   - any other http(s) URL (single-file fetch, e.g. a gist raw URL)
 #   - an SSH path "user@host:/path" (key-based auth only; uses `ssh` CLI)
 #   - a local path on this host (the machine running the proxy, i.e. the DGX)
+#   Optional `mode`: "file" (single file) or "folder" (directory only).
 #
 # Requires the admin token (same one /api/state uses), because this endpoint
 # can read arbitrary filesystem paths and exec ssh. If you want it open,
@@ -4822,10 +4824,47 @@ def _build_codereview_prompt(files: list[dict], instructions: str) -> tuple[str,
     return system, user
 
 
+def _normalize_codereview_files(raw: object) -> list[dict]:
+    """Validate inline `files` from the client: [{path, content}, ...]."""
+    if not isinstance(raw, list) or not raw:
+        raise HTTPException(status_code=400, detail="'files' must be a non-empty list")
+    out: list[dict] = []
+    for i, item in enumerate(raw):
+        if not isinstance(item, dict):
+            raise HTTPException(status_code=400, detail=f"files[{i}] must be an object")
+        p = (item.get("path") or item.get("name") or f"snippet-{i + 1}").strip()
+        content = item.get("content")
+        if content is None:
+            raise HTTPException(status_code=400, detail=f"files[{i}] missing 'content'")
+        if not isinstance(content, str):
+            raise HTTPException(status_code=400, detail=f"files[{i}].content must be a string")
+        if not content.strip():
+            continue
+        out.append({"path": p or f"snippet-{i + 1}", "content": content})
+    if not out:
+        raise HTTPException(status_code=400, detail="No non-empty files in 'files'")
+    if len(out) > CODEREVIEW_MAX_FILES:
+        out = out[:CODEREVIEW_MAX_FILES]
+    return out
+
+
+def _apply_codereview_mode(files: list[dict], mode: str, path: str) -> None:
+    """Enforce -file / -folder semantics after gathering."""
+    if mode == "file" and len(files) > 1:
+        raise HTTPException(
+            status_code=400,
+            detail="`-file` expects a single file; path looks like a directory or matched multiple files",
+        )
+    if mode == "folder":
+        local = Path(path).expanduser()
+        if local.exists() and local.is_file():
+            raise HTTPException(status_code=400, detail="`-folder` expects a directory, not a file")
+
+
 @app.post("/api/codereview")
 async def code_review(req: Request) -> StreamingResponse:
-    """Gather code from `path` (GitHub URL / other URL / SSH / local) and
-    stream a review from Ollama as NDJSON, same shape as /api/chat."""
+    """Gather code from `path` (GitHub URL / other URL / SSH / local), from an
+    inline `files` list, and stream a review from Ollama as NDJSON."""
     _check_auth(req)
 
     try:
@@ -4834,8 +4873,8 @@ async def code_review(req: Request) -> StreamingResponse:
         raise HTTPException(status_code=400, detail="Invalid JSON body")
 
     path = (body.get("path") or "").strip()
-    if not path:
-        raise HTTPException(status_code=400, detail="Missing 'path'")
+    mode = (body.get("mode") or "").strip().lower()
+    raw_files = body.get("files")
     model = (body.get("model") or "").strip() or CODEREVIEW_DEFAULT_MODEL
     instructions = (body.get("instructions") or "").strip()
     try:
@@ -4843,39 +4882,48 @@ async def code_review(req: Request) -> StreamingResponse:
     except (TypeError, ValueError):
         temperature = 0.2
 
-    # Resolve path → list of files. Order matters: the git-SSH-remote pattern
-    # for GitHub overlaps the generic user@host:path pattern, so check it first.
-    try:
-        gh_ssh = _GIT_SSH_GITHUB_RE.match(path)
-        if gh_ssh:
-            owner, repo = gh_ssh.group(1), gh_ssh.group(2)
-            files = await _fetch_github(f"https://github.com/{owner}/{repo}")
-        elif path.startswith(("https://github.com/", "http://github.com/")):
-            files = await _fetch_github(path)
-        elif path.startswith(("http://", "https://")):
-            files = await _fetch_url(path)
-        elif _SSH_PATH_RE.match(path):
-            m = _SSH_PATH_RE.match(path)
-            assert m is not None
-            files = await asyncio.to_thread(_fetch_ssh, m.group(1), m.group(2), m.group(3))
-        else:
-            files = await asyncio.to_thread(_walk_local, Path(path).expanduser())
-    except HTTPException:
-        raise
-    except httpx.HTTPStatusError as e:
-        raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
-    except Exception as e:
-        log.exception("codereview: gather failed for %s", path)
-        raise HTTPException(status_code=500,
-                            detail=f"Failed to gather files: {e.__class__.__name__}: {e}")
+    source_label = path or "inline"
+    if raw_files is not None:
+        files = _normalize_codereview_files(raw_files)
+        source_label = "inline"
+    elif path:
+        # Resolve path → list of files. Order matters: the git-SSH-remote pattern
+        # for GitHub overlaps the generic user@host:path pattern, so check it first.
+        try:
+            gh_ssh = _GIT_SSH_GITHUB_RE.match(path)
+            if gh_ssh:
+                owner, repo = gh_ssh.group(1), gh_ssh.group(2)
+                files = await _fetch_github(f"https://github.com/{owner}/{repo}")
+            elif path.startswith(("https://github.com/", "http://github.com/")):
+                files = await _fetch_github(path)
+            elif path.startswith(("http://", "https://")):
+                files = await _fetch_url(path)
+            elif _SSH_PATH_RE.match(path):
+                m = _SSH_PATH_RE.match(path)
+                assert m is not None
+                files = await asyncio.to_thread(_fetch_ssh, m.group(1), m.group(2), m.group(3))
+            else:
+                files = await asyncio.to_thread(_walk_local, Path(path).expanduser())
+        except HTTPException:
+            raise
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(status_code=502, detail=f"Upstream error: {e}")
+        except Exception as e:
+            log.exception("codereview: gather failed for %s", path)
+            raise HTTPException(status_code=500,
+                                detail=f"Failed to gather files: {e.__class__.__name__}: {e}")
+        if mode in ("file", "folder"):
+            _apply_codereview_mode(files, mode, path)
+    else:
+        raise HTTPException(status_code=400, detail="Missing 'path' or 'files'")
 
     if not files:
         raise HTTPException(status_code=400, detail="No reviewable files found at that path")
 
     system_prompt, user_prompt = _build_codereview_prompt(files, instructions)
     total_chars = sum(len(f["content"]) for f in files)
-    log.info("codereview: path=%r files=%d chars=%d model=%s",
-             path, len(files), total_chars, model)
+    log.info("codereview: source=%r files=%d chars=%d model=%s",
+             source_label, len(files), total_chars, model)
 
     upstream = json.dumps({
         "model": model,
@@ -4891,7 +4939,7 @@ async def code_review(req: Request) -> StreamingResponse:
     if len(files) > 20:
         file_list_preview += f"\n  - … and {len(files) - 20} more"
     preamble = (
-        f"_Gathered **{len(files)}** file(s) ({total_chars:,} chars) from `{path}`._\n"
+        f"_Gathered **{len(files)}** file(s) ({total_chars:,} chars) from `{source_label}`._\n"
         f"_Model: `{model}`._\n\n"
         f"<details><summary>Files reviewed</summary>\n\n{file_list_preview}\n\n</details>\n\n"
     )

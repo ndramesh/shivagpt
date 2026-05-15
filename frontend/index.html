@@ -2405,7 +2405,7 @@
         { name: '/debug', desc: 'Show system debug info', hasArgs: false },
         { name: '/imgen', desc: 'Generate image — use -model realvis for realistic faces, -upscale 4 for ~4K', hasArgs: true, hint: '[-model realvis|flux-dev|jug] [-size N] [-aspect W:H] [-upscale X] <prompt>' },
         { name: '/palm', desc: 'Novelty palm reading — attach a palm image first (entertainment, not advice)', hasArgs: true, hint: '[-name "X"] [-hand left|right] [focus]' },
-        { name: '/codereview', desc: 'Review code from a URL, ssh path, or local folder', hasArgs: true, hint: '[-model X] <path>' },
+        { name: '/codereview', desc: 'Review inline code, a file, folder, URL, or ssh path', hasArgs: true, hint: '[-model X] [-file path | -folder path | paste code]' },
         { name: '/search', desc: 'Web search (SearXNG) + cited answer', hasArgs: true, hint: '[-model X] <query>' },
         { name: '/fetch', desc: 'Fetch a URL and answer questions about it', hasArgs: true, hint: '<url> [question]' },
         { name: '/stock', desc: 'Stock quote + technicals + analyst consensus (real-time via Alpaca)', hasArgs: true, hint: '<ticker> [options|news]' },
@@ -4303,10 +4303,71 @@
         }
       }
 
+      function _codereviewLooksLikePath(p) {
+        return /^(https?:\/\/|git@[^:]+:|[^@\s/]+@[^@\s/]+:|\/|~\/|\.\/|\.\.)/.test(p);
+      }
+
+      function _codereviewExtractFencedFiles(s) {
+        const files = [];
+        const re = /```([^\n`]*)\n([\s\S]*?)```/g;
+        let m;
+        while ((m = re.exec(s)) !== null) {
+          const langLine = (m[1] || '').trim();
+          let path = '';
+          let content = m[2];
+          const fileHint = langLine.match(/^(?:file:)?\s*(\S+)$/i);
+          if (fileHint) path = fileHint[1];
+          else if (langLine && !/^[a-z0-9+#.-]+$/i.test(langLine)) path = langLine;
+          if (!path) path = `snippet-${files.length + 1}`;
+          files.push({ path, content: content.replace(/\n$/, '') });
+        }
+        return files;
+      }
+
+      /** Parse full `/codereview ...` composer text (may be multi-line). */
+      function parseCodeReviewInput(fullText) {
+        const rest = fullText.replace(/^\/codereview\b\s*/i, '');
+        let model = '';
+        let mode = ''; // '', 'file', 'folder'
+        let path = '';
+        let s = rest.trimStart();
+
+        while (s.length) {
+          const mModel = s.match(/^(?:-m|-model|--model)\s+(\S+)\s*(.*)$/s);
+          if (mModel) { model = mModel[1]; s = mModel[2].trimStart(); continue; }
+          const mFile = s.match(/^(?:-file|--file)\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*(.*)$/s);
+          if (mFile) { mode = 'file'; path = mFile[1] || mFile[2] || mFile[3]; s = mFile[4].trimStart(); continue; }
+          const mFolder = s.match(/^(?:-folder|--folder)\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*(.*)$/s);
+          if (mFolder) { mode = 'folder'; path = mFolder[1] || mFolder[2] || mFolder[3]; s = mFolder[4].trimStart(); continue; }
+          break;
+        }
+
+        if (mode === 'file' || mode === 'folder') {
+          return { model, mode, path, instructions: s.trim(), files: null };
+        }
+
+        const firstSp = s.indexOf(' ');
+        const firstTok = firstSp < 0 ? s : s.slice(0, firstSp);
+        const afterTok = firstSp < 0 ? '' : s.slice(firstSp + 1);
+        if (firstTok && _codereviewLooksLikePath(firstTok)) {
+          return { model, mode: '', path: firstTok, instructions: afterTok.trim(), files: null };
+        }
+
+        const files = _codereviewExtractFencedFiles(s);
+        let instructions = '';
+        if (files.length) {
+          const firstFence = s.indexOf('```');
+          if (firstFence > 0) instructions = s.slice(0, firstFence).trim();
+        } else if (s.trim()) {
+          files.push({ path: 'snippet', content: s.trim() });
+        }
+        return { model, mode: 'inline', path: '', instructions, files };
+      }
+
       async function handleSlashCommandExecution(text) {
-        const parts = text.split(' ');
-        const cmdName = parts[0].toLowerCase();
-        const args = parts.slice(1).join(' ');
+        const cmdMatch = text.match(/^(\/[a-z][a-z0-9-]*)/i);
+        const cmdName = cmdMatch ? cmdMatch[1].toLowerCase() : text.split(' ')[0].toLowerCase();
+        const args = text.slice(cmdMatch ? cmdMatch[0].length : cmdName.length).trimStart();
         
         const cmd = SLASH_COMMANDS.find(c => c.name === cmdName);
         if (!cmd) return false; // not a known command
@@ -4705,27 +4766,29 @@
           }
 
           case '/codereview': {
-            if (!args) {
-              toast('Usage: /codereview [-model <model>] <path> [optional instructions]');
+            const cr = parseCodeReviewInput(text);
+            const hasInline = cr.files && cr.files.length;
+            if (!cr.path && !hasInline) {
+              toast('Usage: /codereview [-model <model>] [-file <path> | -folder <path> | <url-or-path>] [instructions]\nOr paste fenced code after the command.');
               break;
             }
-            // Parse: optional "-model X" / "-m X" prefix, then <path>, then optional instructions.
-            let crModel = '';
-            let rest = args.trim();
-            const mflag = rest.match(/^(?:-m|-model|--model)\s+(\S+)\s*(.*)$/);
-            if (mflag) { crModel = mflag[1]; rest = mflag[2].trim(); }
-            const firstSp = rest.indexOf(' ');
-            const crPath = firstSp < 0 ? rest : rest.slice(0, firstSp).trim();
-            const crInstr = firstSp < 0 ? '' : rest.slice(firstSp + 1).trim();
-            if (!crPath) { toast('Missing <path>'); break; }
             if (!state.adminToken) {
               toast('Admin login required — run /login first');
               break;
             }
             if (!c) c = newConvo();
 
-            // Echo the command as a user message so the convo reads naturally.
-            const echo = `/codereview${crModel ? ` -model ${crModel}` : ''} ${crPath}${crInstr ? `  ${crInstr}` : ''}`;
+            let echo = '/codereview';
+            if (cr.model) echo += ` -model ${cr.model}`;
+            if (cr.mode === 'file') echo += ` -file ${cr.path}`;
+            else if (cr.mode === 'folder') echo += ` -folder ${cr.path}`;
+            else if (cr.path) echo += ` ${cr.path}`;
+            if (cr.instructions) echo += ` ${cr.instructions}`;
+            if (hasInline) {
+              echo += cr.files.map(f =>
+                `\n\`\`\`${f.path}\n${f.content.slice(0, 2000)}${f.content.length > 2000 ? '\n…' : ''}\n\`\`\``
+              ).join('');
+            }
             c.messages.push({ role: 'user', content: echo, ts: Date.now() });
             autoTitleFromFirstUserMsg(c);
             c.updatedAt = Date.now();
@@ -4734,7 +4797,7 @@
             renderActive();
 
             // Append the assistant placeholder + cursor, same pattern as send().
-            const asst = { role: 'assistant', content: '', ts: Date.now(), model: crModel || resolveModel(c.model) };
+            const asst = { role: 'assistant', content: '', ts: Date.now(), model: cr.model || resolveModel(c.model) };
             c.messages.push(asst);
             const wrap = $('messages').querySelector('.msg-wrap') || (() => {
               const n = el('div', { class: 'msg-wrap' });
@@ -4748,11 +4811,13 @@
             contentEl.appendChild(cursor);
             scrollToBottom();
 
-            // If the user didn't pass -model, let the server pick its
-            // CODEREVIEW_DEFAULT_MODEL (a coder model is usually right for
-            // reviews, regardless of which model the conversation is on).
-            await streamCodeReview(c, asst, contentEl, cursor,
-              { model: crModel, path: crPath, instructions: crInstr });
+            await streamCodeReview(c, asst, contentEl, cursor, {
+              model: cr.model,
+              path: cr.path || undefined,
+              mode: (cr.mode === 'file' || cr.mode === 'folder') ? cr.mode : undefined,
+              files: hasInline ? cr.files : undefined,
+              instructions: cr.instructions || '',
+            });
             break;
           }
 
@@ -6439,6 +6504,8 @@ finalHtml,
             body: JSON.stringify({
               model: payload.model || undefined,
               path: payload.path,
+              mode: payload.mode || undefined,
+              files: payload.files || undefined,
               instructions: payload.instructions || '',
             }),
             signal: state.abortController.signal,
