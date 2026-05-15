@@ -40,10 +40,12 @@ if command -v rsync >/dev/null 2>&1; then
     --exclude '.git' \
     --exclude '.DS_Store' \
     --exclude 'server.log' \
+    --exclude 'data/' \
+    --exclude 'scratch/' \
     "$here/" "$HOST:$DIR/"
 else
   echo "rsync not found; falling back to tar+ssh"
-  ( cd "$here" && tar --exclude='.venv' --exclude='__pycache__' --exclude='.git' -cz . ) \
+  ( cd "$here" && tar --exclude='.venv' --exclude='__pycache__' --exclude='.git' --exclude='data' --exclude='scratch' -cz . ) \
     | ssh "$HOST" "cd '$DIR' && tar -xz"
 fi
 
