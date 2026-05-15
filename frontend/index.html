@@ -4332,45 +4332,76 @@
         let path = '';
         let commit = false;
         let commitMessage = '';
-        let s = rest.trimStart();
+        // Flags live on the first line; code fences follow on later lines.
+        const nl = rest.indexOf('\n');
+        let header = (nl < 0 ? rest : rest.slice(0, nl)).trim();
+        const body = nl < 0 ? '' : rest.slice(nl + 1);
 
-        while (s.length) {
-          const mModel = s.match(/^(?:-m|-model|--model)\s+(\S+)\s*(.*)$/s);
-          if (mModel) { model = mModel[1]; s = mModel[2].trimStart(); continue; }
-          const mMsg = s.match(/^(?:-message|--message|-msg)\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*(.*)$/s);
-          if (mMsg) { commitMessage = mMsg[1] || mMsg[2] || mMsg[3]; s = mMsg[4].trimStart(); continue; }
-          const mCommit = s.match(/^(?:-commit|--commit)(?:\s+(?:"([^"]+)"|'([^']+)'|(\S+)))?\s*(.*)$/s);
-          if (mCommit) {
-            commit = true;
-            if (!commitMessage) commitMessage = mCommit[1] || mCommit[2] || mCommit[3] || '';
-            s = mCommit[4].trimStart();
-            continue;
+        const pullFlags = () => {
+          let moved = true;
+          while (moved && header.length) {
+            moved = false;
+            let m;
+            if ((m = header.match(/^(?:-m|-model|--model)\s+(\S+)\s*(.*)$/s))) {
+              model = m[1]; header = m[2].trim(); moved = true; continue;
+            }
+            if ((m = header.match(/^(?:-message|--message|-msg)\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*(.*)$/s))) {
+              commitMessage = m[1] || m[2] || m[3]; header = m[4].trim(); moved = true; continue;
+            }
+            if ((m = header.match(/^(?:-commit|--commit)\s*$/))) {
+              commit = true; header = ''; moved = true; continue;
+            }
+            if ((m = header.match(/^(?:-commit|--commit)\s+(?:"([^"]+)"|'([^']+)'|([^-\s]\S*))\s*(.*)$/s))) {
+              commit = true;
+              if (!commitMessage) commitMessage = m[1] || m[2] || m[3] || '';
+              header = m[4].trim(); moved = true; continue;
+            }
+            if ((m = header.match(/^(?:-file|--file)\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*(.*)$/s))) {
+              mode = 'file'; path = m[1] || m[2] || m[3]; header = m[4].trim(); moved = true; continue;
+            }
+            if ((m = header.match(/^(?:-folder|--folder)\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*(.*)$/s))) {
+              mode = 'folder'; path = m[1] || m[2] || m[3]; header = m[4].trim(); moved = true; continue;
+            }
           }
-          const mFile = s.match(/^(?:-file|--file)\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*(.*)$/s);
-          if (mFile) { mode = 'file'; path = mFile[1] || mFile[2] || mFile[3]; s = mFile[4].trimStart(); continue; }
-          const mFolder = s.match(/^(?:-folder|--folder)\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*(.*)$/s);
-          if (mFolder) { mode = 'folder'; path = mFolder[1] || mFolder[2] || mFolder[3]; s = mFolder[4].trimStart(); continue; }
-          break;
+        };
+        pullFlags();
+        // Accept -commit anywhere on the header line (e.g. after -folder).
+        if (/(?:^|\s)(?:-commit|--commit)(?:\s|$)/.test(header)) {
+          commit = true;
+          header = header
+            .replace(/\s+(?:-commit|--commit)(?:\s+(?:"[^"]+"|'[^']+'|[^-\s]\S*))?(?=\s|$)/g, ' ')
+            .replace(/^(?:-commit|--commit)(?:\s+(?:"[^"]+"|'[^']+'|[^-\s]\S*))?\s*/g, '')
+            .trim();
         }
 
-        if (mode === 'file' || mode === 'folder') {
-          return { model, mode, path, instructions: s.trim(), files: null, commit, commitMessage };
-        }
-
-        const firstSp = s.indexOf(' ');
-        const firstTok = firstSp < 0 ? s : s.slice(0, firstSp);
-        const afterTok = firstSp < 0 ? '' : s.slice(firstSp + 1);
-        if (firstTok && _codereviewLooksLikePath(firstTok)) {
-          return { model, mode: '', path: firstTok, instructions: afterTok.trim(), files: null, commit, commitMessage };
-        }
-
-        const files = _codereviewExtractFencedFiles(s);
+        let s = header;
         let instructions = '';
+        if (mode === 'file' || mode === 'folder') {
+          instructions = s.trim();
+        } else {
+          const firstSp = s.indexOf(' ');
+          const firstTok = firstSp < 0 ? s : s.slice(0, firstSp);
+          const afterTok = firstSp < 0 ? '' : s.slice(firstSp + 1);
+          if (firstTok && _codereviewLooksLikePath(firstTok)) {
+            path = firstTok;
+            instructions = afterTok.trim();
+          }
+        }
+        if (body.trim()) {
+          instructions = instructions ? instructions + '\n' + body.trim() : body.trim();
+        }
+
+        if (mode === 'file' || mode === 'folder' || path) {
+          return { model, mode, path, instructions, files: null, commit, commitMessage };
+        }
+
+        const inlineRest = (header + (body ? '\n' + body : '')).trim();
+        const files = _codereviewExtractFencedFiles(inlineRest);
         if (files.length) {
-          const firstFence = s.indexOf('```');
-          if (firstFence > 0) instructions = s.slice(0, firstFence).trim();
-        } else if (s.trim()) {
-          files.push({ path: 'snippet', content: s.trim() });
+          const firstFence = inlineRest.indexOf('```');
+          if (firstFence > 0) instructions = inlineRest.slice(0, firstFence).trim();
+        } else if (inlineRest) {
+          files.push({ path: 'snippet', content: inlineRest });
         }
         return { model, mode: 'inline', path: '', instructions, files, commit, commitMessage };
       }
@@ -6508,10 +6539,12 @@ finalHtml,
 
         // Slightly different message — the server is fetching/parsing files
         // before the model even starts generating.
+        const slowMsg = payload.commit
+          ? 'Commit mode: generating fixes and running git commit… (may take several minutes).'
+          : 'Still gathering files… (large repos / cold SSH connections can take 10–30s).';
         const slowTimer = setTimeout(() => {
           if (state.streaming && !assistantMsg.content) {
-            contentEl.appendChild(el('div', { class: 'info-banner', id: 'slow-banner-' + assistantMsg.ts },
-              'Still gathering files… (large repos / cold SSH connections can take 10–30s).'));
+            contentEl.appendChild(el('div', { class: 'info-banner', id: 'slow-banner-' + assistantMsg.ts }, slowMsg));
           }
         }, 4500);
 
@@ -6530,7 +6563,7 @@ finalHtml,
               mode: payload.mode || undefined,
               files: payload.files || undefined,
               instructions: payload.instructions || '',
-              commit: payload.commit || undefined,
+              commit: payload.commit === true,
               commit_message: payload.commitMessage || undefined,
             }),
             signal: state.abortController.signal,

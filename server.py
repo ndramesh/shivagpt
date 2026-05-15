@@ -4683,9 +4683,14 @@ async def _fetch_url(url: str) -> list[dict]:
 def _walk_local(root: Path) -> list[dict]:
     if not root.exists():
         raise HTTPException(status_code=404, detail=f"Local path not found: {root}")
+    root = root.resolve()
     if root.is_file():
         try:
-            return [{"path": str(root), "content": root.read_text(encoding="utf-8", errors="replace")}]
+            return [{
+                "path": root.name,
+                "content": root.read_text(encoding="utf-8", errors="replace"),
+                "_abs_path": str(root),
+            }]
         except OSError as e:
             raise HTTPException(status_code=400, detail=f"Cannot read {root}: {e}")
     if not root.is_dir():
@@ -4703,10 +4708,14 @@ def _walk_local(root: Path) -> list[dict]:
             except OSError:
                 continue
             try:
-                rel = p.relative_to(root.parent)
+                rel = p.relative_to(root)
             except ValueError:
-                rel = p
-            out.append({"path": str(rel), "content": content})
+                rel = p.name
+            out.append({
+                "path": str(rel).replace("\\", "/"),
+                "content": content,
+                "_abs_path": str(p.resolve()),
+            })
             if len(out) >= CODEREVIEW_MAX_FILES:
                 return out
     return out
@@ -4833,17 +4842,21 @@ def _codereview_abs_path_index(files: list[dict], source_path: str) -> dict[str,
     """Map each gathered file['path'] to its absolute path on disk."""
     src = Path(source_path).expanduser().resolve()
     index: dict[str, Path] = {}
-    if src.is_file():
-        if files:
-            index[files[0]["path"]] = src
+    if src.is_file() and files:
+        ap = files[0].get("_abs_path")
+        index[files[0]["path"]] = Path(ap).resolve() if ap else src
         return index
     for f in files:
         key = f["path"]
+        ap = f.get("_abs_path")
+        if ap:
+            index[key] = Path(ap).resolve()
+            continue
         p = Path(key)
         if p.is_absolute() and p.is_file():
             index[key] = p.resolve()
             continue
-        for cand in (src / key, src / p.name, src.parent / key, src.parent / p):
+        for cand in (src / key, src / p.name):
             try:
                 resolved = cand.resolve()
             except OSError:
@@ -4852,6 +4865,45 @@ def _codereview_abs_path_index(files: list[dict], source_path: str) -> dict[str,
                 index[key] = resolved
                 break
     return index
+
+
+def _codereview_match_model_path(key: str, abs_index: dict[str, Path]) -> tuple[str, Path] | None:
+    """Resolve a model-returned path to an indexed file."""
+    key = (key or "").strip().replace("\\", "/")
+    if not key:
+        return None
+    if key in abs_index:
+        return key, abs_index[key]
+    norm = key.lstrip("./")
+    for ik, ip in abs_index.items():
+        ik_n = ik.replace("\\", "/")
+        if ik_n == norm or ik_n == key:
+            return ik, ip
+        if ik_n.endswith("/" + norm) or norm.endswith("/" + ik_n):
+            return ik, ip
+        if Path(ik_n).name == Path(norm).name:
+            return ik, ip
+    return None
+
+
+def _codereview_paths_for_prompt(files: list[dict], repo_root: Path, abs_index: dict[str, Path]) -> list[dict]:
+    """Copy files using repo-relative paths so the model echoes them back."""
+    out: list[dict] = []
+    for f in files:
+        key = f["path"]
+        abs_p = abs_index.get(key)
+        if abs_p is None:
+            hit = _codereview_match_model_path(key, abs_index)
+            if hit:
+                key, abs_p = hit
+        prompt_path = key
+        if abs_p is not None:
+            try:
+                prompt_path = str(abs_p.resolve().relative_to(repo_root)).replace("\\", "/")
+            except ValueError:
+                prompt_path = key
+        out.append({**f, "path": prompt_path})
+    return out
 
 
 def _parse_ollama_json_object(raw: str) -> dict:
@@ -4940,23 +4992,22 @@ def _apply_codereview_writes(
     """Write changed files; return repo-relative paths that were modified."""
     repo_root = repo_root.resolve()
     changed: list[str] = []
-    by_basename = {p.name: (k, p) for k, p in abs_index.items()}
+    skipped: list[str] = []
+    unchanged: list[str] = []
 
     for item in updated:
         if not isinstance(item, dict):
             continue
-        key = (item.get("path") or "").strip()
+        raw_key = (item.get("path") or "").strip()
         content = item.get("content")
-        if not key or not isinstance(content, str):
+        if not raw_key or not isinstance(content, str):
             continue
-        abs_p = abs_index.get(key)
-        if abs_p is None:
-            hit = by_basename.get(Path(key).name)
-            if hit:
-                key, abs_p = hit[0], hit[1]
-        if abs_p is None:
-            log.warning("codereview commit: skipping unknown path %r", key)
+        hit = _codereview_match_model_path(raw_key, abs_index)
+        if hit is None:
+            skipped.append(raw_key)
+            log.warning("codereview commit: skipping unknown path %r", raw_key)
             continue
+        key, abs_p = hit
         resolved = abs_p.resolve()
         root_s = str(repo_root)
         if resolved != repo_root and not str(resolved).startswith(root_s + os.sep):
@@ -4966,15 +5017,27 @@ def _apply_codereview_writes(
         except OSError as e:
             raise HTTPException(status_code=400, detail=f"Cannot read {key}: {e}")
         if content == old:
+            unchanged.append(key)
             continue
         try:
             abs_p.write_text(content, encoding="utf-8")
         except OSError as e:
             raise HTTPException(status_code=500, detail=f"Cannot write {key}: {e}")
         try:
-            changed.append(str(resolved.relative_to(repo_root)))
+            changed.append(str(resolved.relative_to(repo_root)).replace("\\", "/"))
         except ValueError:
             changed.append(str(resolved))
+    if not changed:
+        detail = "No file changes were written."
+        if skipped:
+            detail += f" Unknown paths: {', '.join(skipped[:8])}."
+        if unchanged and not skipped:
+            detail += f" Model returned {len(unchanged)} file(s) identical to disk."
+        if not updated:
+            detail += " Model returned an empty files list."
+        known = ", ".join(sorted(abs_index.keys())[:12])
+        detail += f" Expected paths like: {known}."
+        raise HTTPException(status_code=400, detail=detail)
     return changed
 
 
@@ -4982,14 +5045,17 @@ def _git_commit_files(repo_root: Path, rel_paths: list[str], message: str) -> st
     if not rel_paths:
         raise HTTPException(status_code=400, detail="No file changes to commit")
     repo = str(repo_root)
+    git_name = os.getenv("SHIVAGPT_GIT_USER_NAME", "ShivaGPT")
+    git_email = os.getenv("SHIVAGPT_GIT_USER_EMAIL", "shivagpt@localhost")
+    git_cfg = ["-c", f"user.name={git_name}", "-c", f"user.email={git_email}"]
     add = subprocess.run(
-        ["git", "-C", repo, "add", "--"] + rel_paths,
+        ["git", "-C", repo, *git_cfg, "add", "--"] + rel_paths,
         capture_output=True, text=True, timeout=30,
     )
     if add.returncode != 0:
         raise HTTPException(status_code=500, detail=f"git add failed: {add.stderr[:500]}")
     commit = subprocess.run(
-        ["git", "-C", repo, "commit", "-m", message],
+        ["git", "-C", repo, *git_cfg, "commit", "-m", message],
         capture_output=True, text=True, timeout=30,
     )
     combined = (commit.stdout or "") + (commit.stderr or "")
@@ -5151,26 +5217,34 @@ async def code_review(req: Request) -> StreamingResponse:
 
         async def commit_streamer():
             yield (json.dumps({"message": {"role": "assistant", "content": preamble}}) + "\n").encode()
-            progress = "_Applying fixes and committing… (this may take a few minutes)._\n\n"
+            progress = (
+                f"_**Commit mode** — repo `{repo_root}`._\n\n"
+                "_Applying fixes and committing… (this may take a few minutes)._\n\n"
+            )
             yield (json.dumps({"message": {"role": "assistant", "content": progress}}) + "\n").encode()
             try:
                 abs_index = await asyncio.to_thread(_codereview_abs_path_index, files, path)
                 if not abs_index:
                     raise HTTPException(status_code=400, detail="Could not resolve local file paths")
+                log.info("codereview commit: repo=%s indexed=%d paths", repo_root, len(abs_index))
 
-                result = await _ollama_codereview_apply(model, files, instructions, temperature)
+                prompt_files = _codereview_paths_for_prompt(files, repo_root, abs_index)
+                result = await _ollama_codereview_apply(model, prompt_files, instructions, temperature)
                 updated = result.get("files") or []
                 if not isinstance(updated, list):
                     raise HTTPException(status_code=502, detail="Model JSON missing 'files' array")
+                log.info("codereview commit: model returned %d file(s)", len(updated))
 
                 changed = await asyncio.to_thread(
                     _apply_codereview_writes, abs_index, repo_root, updated,
                 )
+                log.info("codereview commit: wrote %d file(s): %s", len(changed), changed)
                 summary = (result.get("summary") or "").strip()
                 msg = commit_message_override or (result.get("commit_message") or "").strip()
                 if not msg:
                     msg = "Apply code review fixes"
                 sha = await asyncio.to_thread(_git_commit_files, repo_root, changed, msg)
+                log.info("codereview commit: committed %s", sha)
 
                 footer = (
                     f"\n\n---\n\n**Committed** `{sha}` — {len(changed)} file(s):\n"
@@ -5181,14 +5255,20 @@ async def code_review(req: Request) -> StreamingResponse:
                 yield (json.dumps({"message": {"role": "assistant", "content": body_out}}) + "\n").encode()
                 yield (json.dumps({"done": True}) + "\n").encode()
             except HTTPException as e:
-                yield (json.dumps({"error": e.detail, "status": e.status_code}) + "\n").encode()
+                err = e.detail if isinstance(e.detail, str) else json.dumps(e.detail)
+                yield (json.dumps({"error": err, "status": e.status_code}) + "\n").encode()
+                yield (json.dumps({"message": {"role": "assistant", "content": f"\n\n**Commit failed:** {err}\n"}}) + "\n").encode()
+                yield (json.dumps({"done": True}) + "\n").encode()
             except httpx.ConnectError:
                 yield (json.dumps({"error": f"Cannot connect to Ollama at {OLLAMA_URL}."}) + "\n").encode()
             except httpx.ReadTimeout:
                 yield (json.dumps({"error": "Ollama timed out while generating fixes."}) + "\n").encode()
             except Exception as e:
                 log.exception("codereview commit failed")
-                yield (json.dumps({"error": f"Server error: {e.__class__.__name__}: {e}"}) + "\n").encode()
+                err = f"Server error: {e.__class__.__name__}: {e}"
+                yield (json.dumps({"error": err}) + "\n").encode()
+                yield (json.dumps({"message": {"role": "assistant", "content": f"\n\n**Commit failed:** {err}\n"}}) + "\n").encode()
+                yield (json.dumps({"done": True}) + "\n").encode()
 
         return StreamingResponse(
             commit_streamer(),
