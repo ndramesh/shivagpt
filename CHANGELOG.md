@@ -4,6 +4,11 @@ All notable changes to ShivaGPT are documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- **Massive `/trader` rewrite & multi-threading.** The social sentiment scanner is now fully multi-threaded via `ThreadPoolExecutor` and uses a refined set of working providers: Reddit, Stocktwits, Apewisdom, CNBC, and Hackernews (Finviz, SeekingAlpha, Bluesky, and Yahoo were removed). 
+- **`/trader` ranking algorithm overhauled.** The ranking logic now utilizes a "Composite Rank" that strongly rewards cross-platform corroboration. It uses raw engagement (likes/upvotes/points, now including Stocktwits watch counts) as a base, multiplied by the number of distinct sources the ticker appeared on, with a fallback tie-breaker based on mention count.
+
+
 ### Added
 - **`/palm` now takes `-name "Full Name"` and `-hand left|right`.**
   Server-side, the hand goes into the prompt with the right palmistry

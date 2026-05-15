@@ -338,6 +338,23 @@ API surface than Alpaca's contract-discovery flow). If you need
 real-time options quotes too, the Alpaca `OptionHistoricalDataClient`
 helpers are already wired up in `server.py` and can be plugged in.
 
+## Trader Sentiment Scanner (`/trader`)
+
+`/trader` is a multi-threaded web scraper that cross-references trending tickers across social platforms to give you a pulse on retail and market sentiment. 
+
+```
+/trader
+```
+
+It queries **Reddit** (r/wallstreetbets, r/stocks, r/investing, r/options, r/stockmarket), **Stocktwits**, **Apewisdom**, **CNBC**, and **Hacker News** in parallel. It uses a composite ranking algorithm that strongly rewards cross-platform corroboration (scoring tickers based on engagement multiplied by the number of distinct platforms they appear on). 
+
+For the top-ranking tickers, the server then uses a local LLM (`qwen3:8b` by default) to rapidly evaluate the general sentiment of the discussions to categorize them as `Bullish`, `Bearish`, or `Neutral`.
+
+You can also hook this up to the scheduler to receive automated pre-market and post-market trader briefings to your email:
+```
+/schedule add trader_premarket "weekday 06:15" trader -email me@example.com
+```
+
 ## Voice in (mic button) and voice out (read aloud)
 
 The composer has a microphone button next to the paperclip. Click to
