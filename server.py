@@ -4507,6 +4507,7 @@ async def schedules_runs(sched_id: int, req: Request) -> dict[str, Any]:
 #   - an SSH path "user@host:/path" (key-based auth only; uses `ssh` CLI)
 #   - a local path on this host (the machine running the proxy, i.e. the DGX)
 #   Optional `mode`: "file" (single file) or "folder" (directory only).
+#   Optional `commit`: apply fixes to local files and git commit (local paths only).
 #
 # Requires the admin token (same one /api/state uses), because this endpoint
 # can read arbitrary filesystem paths and exec ssh. If you want it open,
@@ -4516,6 +4517,7 @@ async def schedules_runs(sched_id: int, req: Request) -> dict[str, Any]:
 CODEREVIEW_MAX_FILES = int(os.getenv("CODEREVIEW_MAX_FILES", "30"))
 CODEREVIEW_MAX_CHARS = int(os.getenv("CODEREVIEW_MAX_CHARS", "120000"))
 CODEREVIEW_DEFAULT_MODEL = os.getenv("CODEREVIEW_DEFAULT_MODEL", "deepseek-coder-v2")
+CODEREVIEW_COMMIT_NUM_PREDICT = int(os.getenv("CODEREVIEW_COMMIT_NUM_PREDICT", "32000"))
 
 CODEREVIEW_FILE_EXTS = {
     ".py", ".pyx", ".pyi",
@@ -4802,6 +4804,206 @@ def _fetch_ssh(user: str, host: str, remote_path: str) -> list[dict]:
     return out
 
 
+def _codereview_path_is_local(path: str) -> bool:
+    if not path:
+        return False
+    if path.startswith(("http://", "https://")):
+        return False
+    if _GIT_SSH_GITHUB_RE.match(path):
+        return False
+    if _SSH_PATH_RE.match(path):
+        return False
+    return True
+
+
+def _git_toplevel(start: Path) -> Path | None:
+    try:
+        r = subprocess.run(
+            ["git", "-C", str(start), "rev-parse", "--show-toplevel"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            return Path(r.stdout.strip()).resolve()
+    except (subprocess.TimeoutExpired, OSError):
+        pass
+    return None
+
+
+def _codereview_abs_path_index(files: list[dict], source_path: str) -> dict[str, Path]:
+    """Map each gathered file['path'] to its absolute path on disk."""
+    src = Path(source_path).expanduser().resolve()
+    index: dict[str, Path] = {}
+    if src.is_file():
+        if files:
+            index[files[0]["path"]] = src
+        return index
+    for f in files:
+        key = f["path"]
+        p = Path(key)
+        if p.is_absolute() and p.is_file():
+            index[key] = p.resolve()
+            continue
+        for cand in (src / key, src / p.name, src.parent / key, src.parent / p):
+            try:
+                resolved = cand.resolve()
+            except OSError:
+                continue
+            if resolved.is_file():
+                index[key] = resolved
+                break
+    return index
+
+
+def _parse_ollama_json_object(raw: str) -> dict:
+    raw_clean = re.sub(r"<think>[\s\S]*?</think>\s*", "", raw, flags=re.IGNORECASE)
+    raw_clean = re.sub(r"^```(?:json)?\s*", "", raw_clean.strip(), flags=re.IGNORECASE)
+    raw_clean = re.sub(r"\s*```\s*$", "", raw_clean)
+    try:
+        obj = json.loads(raw_clean)
+        if isinstance(obj, dict):
+            return obj
+    except json.JSONDecodeError:
+        pass
+    m = re.search(r"\{[\s\S]*\}", raw_clean)
+    if not m:
+        raise HTTPException(status_code=502, detail=f"Model returned no JSON: {raw[:300]!r}")
+    try:
+        obj = json.loads(m.group(0))
+    except json.JSONDecodeError as e:
+        raise HTTPException(status_code=502, detail=f"Model JSON unparseable: {e}")
+    if not isinstance(obj, dict):
+        raise HTTPException(status_code=502, detail="Model JSON must be an object")
+    return obj
+
+
+async def _ollama_codereview_apply(
+    model: str,
+    files: list[dict],
+    instructions: str,
+    temperature: float,
+) -> dict:
+    """Ask the model to fix files and return structured {summary, commit_message, files}."""
+    files, truncated = _truncate_bundle(files, CODEREVIEW_MAX_CHARS)
+    body_parts = []
+    for f in files:
+        body_parts.append(f"\n### `{f['path']}`\n```\n{f['content']}\n```\n")
+    instr_block = f"{instructions.strip()}\n\n" if instructions.strip() else ""
+    user = (
+        f"{instr_block}Review the following {len(files)} file(s), apply focused fixes, "
+        "and return the updated files.\n"
+        + ("\n[NOTE: input was truncated to fit budget.]" if truncated else "")
+        + "".join(body_parts)
+    )
+    system = (
+        "You are a senior software engineer. Review the code, apply concrete fixes "
+        "(correctness, security, maintainability — skip style nitpicks), and output "
+        "ONLY valid JSON (no markdown fences, no commentary outside JSON) with this schema:\n"
+        "{\n"
+        '  "summary": "markdown for the user: what you reviewed and what you changed",\n'
+        '  "commit_message": "imperative git subject, <=72 chars, no trailing period",\n'
+        '  "files": [{"path": "<exact path from input>", "content": "<complete updated file>"}]\n'
+        "}\n"
+        "Include ONLY files you actually changed. Each path must match an input path exactly. "
+        "Emit complete file contents, not diffs or patches."
+    )
+    is_thinking = "thinking" in model.lower() or model.lower().endswith("-think")
+    upstream_payload: dict[str, Any] = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "stream": False,
+        "options": {"temperature": temperature, "num_predict": CODEREVIEW_COMMIT_NUM_PREDICT},
+    }
+    if not is_thinking:
+        upstream_payload["format"] = "json"
+
+    timeout = httpx.Timeout(connect=10.0, read=600.0, write=30.0, pool=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as cli:
+        r = await cli.post(
+            f"{OLLAMA_URL}/api/chat",
+            content=json.dumps(upstream_payload).encode("utf-8"),
+            headers={"content-type": "application/json"},
+        )
+    if r.status_code != 200:
+        raise HTTPException(status_code=502, detail=f"Ollama returned {r.status_code}: {r.text[:300]}")
+    raw = (r.json().get("message") or {}).get("content") or ""
+    return _parse_ollama_json_object(raw)
+
+
+def _apply_codereview_writes(
+    abs_index: dict[str, Path],
+    repo_root: Path,
+    updated: list[dict],
+) -> list[str]:
+    """Write changed files; return repo-relative paths that were modified."""
+    repo_root = repo_root.resolve()
+    changed: list[str] = []
+    by_basename = {p.name: (k, p) for k, p in abs_index.items()}
+
+    for item in updated:
+        if not isinstance(item, dict):
+            continue
+        key = (item.get("path") or "").strip()
+        content = item.get("content")
+        if not key or not isinstance(content, str):
+            continue
+        abs_p = abs_index.get(key)
+        if abs_p is None:
+            hit = by_basename.get(Path(key).name)
+            if hit:
+                key, abs_p = hit[0], hit[1]
+        if abs_p is None:
+            log.warning("codereview commit: skipping unknown path %r", key)
+            continue
+        resolved = abs_p.resolve()
+        root_s = str(repo_root)
+        if resolved != repo_root and not str(resolved).startswith(root_s + os.sep):
+            raise HTTPException(status_code=400, detail=f"Refusing to write outside repo: {key}")
+        try:
+            old = abs_p.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            raise HTTPException(status_code=400, detail=f"Cannot read {key}: {e}")
+        if content == old:
+            continue
+        try:
+            abs_p.write_text(content, encoding="utf-8")
+        except OSError as e:
+            raise HTTPException(status_code=500, detail=f"Cannot write {key}: {e}")
+        try:
+            changed.append(str(resolved.relative_to(repo_root)))
+        except ValueError:
+            changed.append(str(resolved))
+    return changed
+
+
+def _git_commit_files(repo_root: Path, rel_paths: list[str], message: str) -> str:
+    if not rel_paths:
+        raise HTTPException(status_code=400, detail="No file changes to commit")
+    repo = str(repo_root)
+    add = subprocess.run(
+        ["git", "-C", repo, "add", "--"] + rel_paths,
+        capture_output=True, text=True, timeout=30,
+    )
+    if add.returncode != 0:
+        raise HTTPException(status_code=500, detail=f"git add failed: {add.stderr[:500]}")
+    commit = subprocess.run(
+        ["git", "-C", repo, "commit", "-m", message],
+        capture_output=True, text=True, timeout=30,
+    )
+    combined = (commit.stdout or "") + (commit.stderr or "")
+    if commit.returncode != 0:
+        if "nothing to commit" in combined.lower() or "no changes added to commit" in combined.lower():
+            raise HTTPException(status_code=400, detail="Nothing to commit (no diff vs HEAD?)")
+        raise HTTPException(status_code=500, detail=f"git commit failed: {combined[:500]}")
+    sha = subprocess.run(
+        ["git", "-C", repo, "rev-parse", "--short", "HEAD"],
+        capture_output=True, text=True, timeout=10,
+    )
+    return sha.stdout.strip() if sha.returncode == 0 else "?"
+
+
 def _build_codereview_prompt(files: list[dict], instructions: str) -> tuple[str, str]:
     files, truncated = _truncate_bundle(files, CODEREVIEW_MAX_CHARS)
     body_parts = []
@@ -4877,10 +5079,18 @@ async def code_review(req: Request) -> StreamingResponse:
     raw_files = body.get("files")
     model = (body.get("model") or "").strip() or CODEREVIEW_DEFAULT_MODEL
     instructions = (body.get("instructions") or "").strip()
+    commit = _is_truthy(str(body.get("commit", ""))) or body.get("commit") is True
+    commit_message_override = (body.get("commit_message") or "").strip()
     try:
         temperature = float(body.get("temperature", 0.2))
     except (TypeError, ValueError):
         temperature = 0.2
+
+    if commit and (raw_files is not None or not _codereview_path_is_local(path)):
+        raise HTTPException(
+            status_code=400,
+            detail="`-commit` requires a local path (-file, -folder, or a path on this host)",
+        )
 
     source_label = path or "inline"
     if raw_files is not None:
@@ -4920,10 +5130,73 @@ async def code_review(req: Request) -> StreamingResponse:
     if not files:
         raise HTTPException(status_code=400, detail="No reviewable files found at that path")
 
-    system_prompt, user_prompt = _build_codereview_prompt(files, instructions)
     total_chars = sum(len(f["content"]) for f in files)
-    log.info("codereview: source=%r files=%d chars=%d model=%s",
-             source_label, len(files), total_chars, model)
+    log.info("codereview: source=%r files=%d chars=%d model=%s commit=%s",
+             source_label, len(files), total_chars, model, commit)
+
+    file_list_preview = "\n".join(f"  - `{f['path']}`" for f in files[:20])
+    if len(files) > 20:
+        file_list_preview += f"\n  - … and {len(files) - 20} more"
+    preamble = (
+        f"_Gathered **{len(files)}** file(s) ({total_chars:,} chars) from `{source_label}`._\n"
+        f"_Model: `{model}`._\n\n"
+        f"<details><summary>Files reviewed</summary>\n\n{file_list_preview}\n\n</details>\n\n"
+    )
+
+    if commit:
+        local_root = Path(path).expanduser().resolve()
+        repo_root = await asyncio.to_thread(_git_toplevel, local_root)
+        if repo_root is None:
+            raise HTTPException(status_code=400, detail="`-commit` requires a git repository")
+
+        async def commit_streamer():
+            yield (json.dumps({"message": {"role": "assistant", "content": preamble}}) + "\n").encode()
+            progress = "_Applying fixes and committing… (this may take a few minutes)._\n\n"
+            yield (json.dumps({"message": {"role": "assistant", "content": progress}}) + "\n").encode()
+            try:
+                abs_index = await asyncio.to_thread(_codereview_abs_path_index, files, path)
+                if not abs_index:
+                    raise HTTPException(status_code=400, detail="Could not resolve local file paths")
+
+                result = await _ollama_codereview_apply(model, files, instructions, temperature)
+                updated = result.get("files") or []
+                if not isinstance(updated, list):
+                    raise HTTPException(status_code=502, detail="Model JSON missing 'files' array")
+
+                changed = await asyncio.to_thread(
+                    _apply_codereview_writes, abs_index, repo_root, updated,
+                )
+                summary = (result.get("summary") or "").strip()
+                msg = commit_message_override or (result.get("commit_message") or "").strip()
+                if not msg:
+                    msg = "Apply code review fixes"
+                sha = await asyncio.to_thread(_git_commit_files, repo_root, changed, msg)
+
+                footer = (
+                    f"\n\n---\n\n**Committed** `{sha}` — {len(changed)} file(s):\n"
+                    + "\n".join(f"- `{p}`" for p in changed)
+                    + f"\n\n```\n{msg}\n```"
+                )
+                body_out = (summary + footer) if summary else footer.lstrip()
+                yield (json.dumps({"message": {"role": "assistant", "content": body_out}}) + "\n").encode()
+                yield (json.dumps({"done": True}) + "\n").encode()
+            except HTTPException as e:
+                yield (json.dumps({"error": e.detail, "status": e.status_code}) + "\n").encode()
+            except httpx.ConnectError:
+                yield (json.dumps({"error": f"Cannot connect to Ollama at {OLLAMA_URL}."}) + "\n").encode()
+            except httpx.ReadTimeout:
+                yield (json.dumps({"error": "Ollama timed out while generating fixes."}) + "\n").encode()
+            except Exception as e:
+                log.exception("codereview commit failed")
+                yield (json.dumps({"error": f"Server error: {e.__class__.__name__}: {e}"}) + "\n").encode()
+
+        return StreamingResponse(
+            commit_streamer(),
+            media_type="application/x-ndjson",
+            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        )
+
+    system_prompt, user_prompt = _build_codereview_prompt(files, instructions)
 
     upstream = json.dumps({
         "model": model,
@@ -4935,17 +5208,7 @@ async def code_review(req: Request) -> StreamingResponse:
         "options": {"temperature": temperature},
     }).encode("utf-8")
 
-    file_list_preview = "\n".join(f"  - `{f['path']}`" for f in files[:20])
-    if len(files) > 20:
-        file_list_preview += f"\n  - … and {len(files) - 20} more"
-    preamble = (
-        f"_Gathered **{len(files)}** file(s) ({total_chars:,} chars) from `{source_label}`._\n"
-        f"_Model: `{model}`._\n\n"
-        f"<details><summary>Files reviewed</summary>\n\n{file_list_preview}\n\n</details>\n\n"
-    )
-
     async def streamer():
-        # Emit a small preamble in the same NDJSON shape Ollama uses.
         yield (json.dumps({"message": {"role": "assistant", "content": preamble}}) + "\n").encode()
         timeout = httpx.Timeout(connect=10.0, read=None, write=30.0, pool=10.0)
         try:

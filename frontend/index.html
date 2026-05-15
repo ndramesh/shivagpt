@@ -2405,7 +2405,7 @@
         { name: '/debug', desc: 'Show system debug info', hasArgs: false },
         { name: '/imgen', desc: 'Generate image — use -model realvis for realistic faces, -upscale 4 for ~4K', hasArgs: true, hint: '[-model realvis|flux-dev|jug] [-size N] [-aspect W:H] [-upscale X] <prompt>' },
         { name: '/palm', desc: 'Novelty palm reading — attach a palm image first (entertainment, not advice)', hasArgs: true, hint: '[-name "X"] [-hand left|right] [focus]' },
-        { name: '/codereview', desc: 'Review inline code, a file, folder, URL, or ssh path', hasArgs: true, hint: '[-model X] [-file path | -folder path | paste code]' },
+        { name: '/codereview', desc: 'Review inline code, a file, folder, URL, or ssh path', hasArgs: true, hint: '[-commit] [-file path | -folder path | paste code]' },
         { name: '/search', desc: 'Web search (SearXNG) + cited answer', hasArgs: true, hint: '[-model X] <query>' },
         { name: '/fetch', desc: 'Fetch a URL and answer questions about it', hasArgs: true, hint: '<url> [question]' },
         { name: '/stock', desc: 'Stock quote + technicals + analyst consensus (real-time via Alpaca)', hasArgs: true, hint: '<ticker> [options|news]' },
@@ -4330,11 +4330,22 @@
         let model = '';
         let mode = ''; // '', 'file', 'folder'
         let path = '';
+        let commit = false;
+        let commitMessage = '';
         let s = rest.trimStart();
 
         while (s.length) {
           const mModel = s.match(/^(?:-m|-model|--model)\s+(\S+)\s*(.*)$/s);
           if (mModel) { model = mModel[1]; s = mModel[2].trimStart(); continue; }
+          const mMsg = s.match(/^(?:-message|--message|-msg)\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*(.*)$/s);
+          if (mMsg) { commitMessage = mMsg[1] || mMsg[2] || mMsg[3]; s = mMsg[4].trimStart(); continue; }
+          const mCommit = s.match(/^(?:-commit|--commit)(?:\s+(?:"([^"]+)"|'([^']+)'|(\S+)))?\s*(.*)$/s);
+          if (mCommit) {
+            commit = true;
+            if (!commitMessage) commitMessage = mCommit[1] || mCommit[2] || mCommit[3] || '';
+            s = mCommit[4].trimStart();
+            continue;
+          }
           const mFile = s.match(/^(?:-file|--file)\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*(.*)$/s);
           if (mFile) { mode = 'file'; path = mFile[1] || mFile[2] || mFile[3]; s = mFile[4].trimStart(); continue; }
           const mFolder = s.match(/^(?:-folder|--folder)\s+(?:"([^"]+)"|'([^']+)'|(\S+))\s*(.*)$/s);
@@ -4343,14 +4354,14 @@
         }
 
         if (mode === 'file' || mode === 'folder') {
-          return { model, mode, path, instructions: s.trim(), files: null };
+          return { model, mode, path, instructions: s.trim(), files: null, commit, commitMessage };
         }
 
         const firstSp = s.indexOf(' ');
         const firstTok = firstSp < 0 ? s : s.slice(0, firstSp);
         const afterTok = firstSp < 0 ? '' : s.slice(firstSp + 1);
         if (firstTok && _codereviewLooksLikePath(firstTok)) {
-          return { model, mode: '', path: firstTok, instructions: afterTok.trim(), files: null };
+          return { model, mode: '', path: firstTok, instructions: afterTok.trim(), files: null, commit, commitMessage };
         }
 
         const files = _codereviewExtractFencedFiles(s);
@@ -4361,7 +4372,7 @@
         } else if (s.trim()) {
           files.push({ path: 'snippet', content: s.trim() });
         }
-        return { model, mode: 'inline', path: '', instructions, files };
+        return { model, mode: 'inline', path: '', instructions, files, commit, commitMessage };
       }
 
       async function handleSlashCommandExecution(text) {
@@ -4769,7 +4780,16 @@
             const cr = parseCodeReviewInput(text);
             const hasInline = cr.files && cr.files.length;
             if (!cr.path && !hasInline) {
-              toast('Usage: /codereview [-model <model>] [-file <path> | -folder <path> | <url-or-path>] [instructions]\nOr paste fenced code after the command.');
+              toast('Usage: /codereview [-model <model>] [-commit] [-file <path> | -folder <path> | <url-or-path>] [instructions]\nOr paste fenced code after the command.');
+              break;
+            }
+            if (cr.commit && (hasInline || (cr.path && _codereviewLooksLikePath(cr.path) &&
+                /^(https?:\/\/|git@)/.test(cr.path)))) {
+              toast('`-commit` only works with a local path on the server (use -file or -folder)');
+              break;
+            }
+            if (cr.commit && cr.path && /[^@\s]+@[^@\s]+:/.test(cr.path) && !/^git@github\.com:/i.test(cr.path)) {
+              toast('`-commit` does not support SSH paths — use a local path on the DGX');
               break;
             }
             if (!state.adminToken) {
@@ -4779,6 +4799,7 @@
             if (!c) c = newConvo();
 
             let echo = '/codereview';
+            if (cr.commit) echo += cr.commitMessage ? ` -commit "${cr.commitMessage}"` : ' -commit';
             if (cr.model) echo += ` -model ${cr.model}`;
             if (cr.mode === 'file') echo += ` -file ${cr.path}`;
             else if (cr.mode === 'folder') echo += ` -folder ${cr.path}`;
@@ -4817,6 +4838,8 @@
               mode: (cr.mode === 'file' || cr.mode === 'folder') ? cr.mode : undefined,
               files: hasInline ? cr.files : undefined,
               instructions: cr.instructions || '',
+              commit: cr.commit || false,
+              commitMessage: cr.commitMessage || '',
             });
             break;
           }
@@ -6507,6 +6530,8 @@ finalHtml,
               mode: payload.mode || undefined,
               files: payload.files || undefined,
               instructions: payload.instructions || '',
+              commit: payload.commit || undefined,
+              commit_message: payload.commitMessage || undefined,
             }),
             signal: state.abortController.signal,
           });
